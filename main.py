@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -27,6 +28,7 @@ from beeper_client import BeeperClient
 from message_logger import MessageLogger
 from profile_extractor import ProfileExtractor
 from query_engine import QueryEngine
+from vector_store import VectorStore
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -60,15 +62,54 @@ def cmd_sync() -> int:
     return 0
 
 
-def cmd_extract() -> int:
-    """Run LLM profile extraction on new messages."""
-    logger.info("Starting profile extraction with Ollama...")
+async def cmd_extract(force_all: bool = False) -> int:
+    """Run LLM profile extraction on messages."""
+    logger.info("Starting grounded async profile extraction with Ollama...")
+    if force_all:
+        logger.info("  !! DEEP ENRICHMENT MODE !! (Processing all history)")
     logger.info(f"  Model: {config.OLLAMA_MODEL}")
 
     extractor = ProfileExtractor()
-    updated = extractor.extract_profiles()
+    updated = await extractor.extract_profiles(force_all=force_all)
     logger.info(f"✓ Extraction complete — {updated} contacts updated")
     logger.info(f"  Profiles: {config.CONTACTS_FILE}")
+    return 0
+
+
+def cmd_index() -> int:
+    """Index all logged messages into the vector store."""
+    logger.info("Starting vector indexing...")
+    if not config.RAW_LOG_FILE.exists():
+        logger.warning(f"No log file found at {config.RAW_LOG_FILE}. Sync messages first.")
+        return 1
+
+    vs = VectorStore()
+    
+    # Load all messages from log
+    messages = []
+    with open(config.RAW_LOG_FILE) as f:
+        for line in f:
+            try:
+                msg = json.loads(line)
+                # Map message record to what VectorStore expects
+                messages.append({
+                    "id": msg["message_id"],
+                    "text": msg["text"],
+                    "sender": msg["sender_name"],
+                    "chat_name": msg["chat_name"],
+                    "timestamp": msg.get("timestamp", ""),
+                    "is_self": msg.get("is_self", False)
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not messages:
+        logger.warning("No messages found in log to index.")
+        return 0
+
+    logger.info(f"Indexing {len(messages)} messages...")
+    vs.index_messages(messages)
+    logger.info(f"✓ Indexing complete — Total items: {vs.get_indexed_count()}")
     return 0
 
 
@@ -116,23 +157,24 @@ def cmd_contacts():
         print("No contacts extracted yet. Run: python main.py sync && python main.py extract")
         return
 
-    print(f"\n{'Name':<30} {'Facts':>6} {'Messages':>9}  Last Updated")
-    print("─" * 75)
+    print(f"\n{'Name':<35} {'Facts':>6} {'Messages':>9}  Last Updated")
+    print("─" * 80)
     for c in contacts:
         updated = c["last_updated"][:10] if c["last_updated"] else "never"
-        print(f"{c['name']:<30} {c['facts']:>6} {c['messages']:>9}  {updated}")
+        print(f"{c['name'][:34]:<35} {c['facts']:>6} {c['messages']:>9}  {updated}")
     print(f"\nTotal: {len(contacts)} contacts")
 
 
-def cmd_run():
-    """Full pipeline: sync → extract → ask."""
+async def cmd_run():
+    """Full pipeline: sync → index → extract → ask."""
     if cmd_sync() != 0:
         return
-    cmd_extract()
+    cmd_index()
+    await cmd_extract()
     cmd_ask()
 
 
-def cmd_daemon():
+async def cmd_daemon():
     """Run sync + extract on a loop."""
     logger.info(
         f"Starting daemon (sync every {config.SYNC_INTERVAL_SECONDS}s)... "
@@ -142,11 +184,12 @@ def cmd_daemon():
     while True:
         try:
             cmd_sync()
-            cmd_extract()
+            cmd_index()
+            await cmd_extract()
             logger.info(
                 f"Sleeping {config.SYNC_INTERVAL_SECONDS}s until next sync..."
             )
-            time.sleep(config.SYNC_INTERVAL_SECONDS)
+            await asyncio.sleep(config.SYNC_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             logger.info("Daemon stopped.")
             break
@@ -202,12 +245,16 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["sync", "extract", "ask", "contacts", "run", "daemon", "bot", "obsidian"],
+        choices=["sync", "index", "extract", "ask", "contacts", "run", "daemon", "bot", "obsidian"],
         help="Command to run",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-extraction of ALL messages (Deep Enrichment)",
     )
 
     args = parser.parse_args()
@@ -217,6 +264,7 @@ def main():
 
     commands = {
         "sync": cmd_sync,
+        "index": cmd_index,
         "extract": cmd_extract,
         "ask": cmd_ask,
         "contacts": cmd_contacts,
@@ -226,9 +274,14 @@ def main():
         "obsidian": cmd_obsidian,
     }
 
-    result = commands[args.command]()
-    if isinstance(result, int):
-        sys.exit(result)
+    if args.command == "extract":
+        sys.exit(asyncio.run(cmd_extract(force_all=args.force)))
+    elif args.command in ["run", "daemon"]:
+        sys.exit(asyncio.run(commands[args.command]()))
+    else:
+        result = commands[args.command]()
+        if isinstance(result, int):
+            sys.exit(result)
 
 
 if __name__ == "__main__":

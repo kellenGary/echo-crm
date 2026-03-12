@@ -19,6 +19,7 @@ import httpx
 
 import config
 from profile_extractor import ProfileExtractor
+from vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class QueryEngine:
         self._ollama_url = config.OLLAMA_BASE_URL
         self._model = config.OLLAMA_MODEL
         self._extractor = ProfileExtractor()
+        self._vector_store = VectorStore()
 
     def ask(self, question: str) -> str:
         """Answer a question about contacts using profiles + message history."""
@@ -106,78 +108,31 @@ class QueryEngine:
         """Format a contact profile for the LLM prompt."""
         lines = [f"### {profile.display_name}"]
         lines.append(f"Messages analyzed: {profile.message_count}")
+        
+        if profile.summary:
+            lines.append(f"Summary: {profile.summary}")
 
         if profile.facts:
+            lines.append("Facts:")
             for fact in profile.facts:
-                confidence = fact.get("confidence", "unknown")
-                category = fact.get("category", "Other")
-                value = fact.get("value", "")
-                source = fact.get("source_quote", "")
-                line = f"- **{category}**: {value} (confidence: {confidence})"
-                if source:
-                    line += f' — _"{source}"_'
+                line = f"- **{fact.category}**: {fact.value}"
+                if fact.source_quote:
+                    line += f' (Source: "{fact.source_quote}")'
                 lines.append(line)
-        else:
-            lines.append("- No extracted facts yet")
-
+        
         return "\n".join(lines)
 
-    def _search_raw_messages(self, question: str, max_results: int = 30) -> str:
-        """Search the raw message log for messages relevant to the question."""
-        if not config.RAW_LOG_FILE.exists():
-            return ""
-
-        # Extract potential search keywords from the question
-        # Filter out common stop words
-        stop_words = {
-            "what", "where", "when", "who", "how", "does", "did", "is", "are",
-            "was", "were", "the", "a", "an", "in", "on", "at", "to", "for",
-            "of", "with", "and", "or", "but", "not", "do", "can", "their",
-            "they", "them", "my", "me", "about", "tell", "know", "work",
-            "live", "like", "from", "has", "have", "had",
-        }
-
-        keywords = [
-            word.lower().strip("?.,!\"'")
-            for word in question.split()
-            if word.lower().strip("?.,!\"'") not in stop_words and len(word) > 2
-        ]
-
-        if not keywords:
-            return ""
-
-        # Scan log for matching messages
-        matches: list[dict[str, Any]] = []
-        with open(config.RAW_LOG_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    text = record.get("text", "").lower()
-                    sender = record.get("sender", "").lower()
-
-                    # Check if any keyword matches in text or sender name
-                    if any(kw in text or kw in sender for kw in keywords):
-                        matches.append(record)
-                except json.JSONDecodeError:
-                    continue
-
+    def _search_raw_messages(self, question: str, max_results: int = 25) -> str:
+        """Search the vector store for messages relevant to the question."""
+        matches = self._vector_store.search(question, limit=max_results)
+        
         if not matches:
             return ""
 
-        # Format matches, most recent first
-        matches.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
         formatted = []
-        for msg in matches[:max_results]:
-            sender = msg.get("sender", "Unknown")
-            ts = msg.get("timestamp", "")[:10]  # Date only
-            chat = msg.get("chat_name", "")
-            text = msg.get("text", "")
-            is_self = msg.get("is_self", False)
-            who = "You" if is_self else sender
-            formatted.append(f"[{ts}] ({chat}) **{who}**: {text}")
+        for msg in matches:
+            # The 'text' in search results is already formatted by VectorStore
+            formatted.append(msg["text"])
 
         return "\n".join(formatted)
 

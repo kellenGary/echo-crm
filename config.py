@@ -11,13 +11,15 @@ BEEPER_API_TOKEN = os.getenv("BEEPER_API_TOKEN", "7160b021-e5a0-4c29-8c3f-816f31
 
 # --- Ollama LLM ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 # --- Data Storage ---
 DATA_DIR = Path(os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")))
 RAW_LOG_FILE = DATA_DIR / "messages.jsonl"          # Raw message log (JSON Lines)
 CONTACTS_FILE = DATA_DIR / "contacts.json"           # Extracted contact profiles
 SYNC_STATE_FILE = DATA_DIR / "sync_state.json"       # Tracks last sync position per chat
+VECTOR_DB_DIR = DATA_DIR / "vector_db"               # ChromaDB storage
 
 # --- Note to Self Chatbot ---
 NOTE_TO_SELF_CHAT_ID = os.getenv(

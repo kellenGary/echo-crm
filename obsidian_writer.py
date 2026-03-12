@@ -124,8 +124,16 @@ class ObsidianWriter:
             # Get this contact's messages
             contact_msgs = messages_by_contact.get(contact_id, [])
 
-            # Extract entities via LLM
-            entities = self._extract_entities(contact_name, contact_msgs)
+            # We build a temporary entities dict for Obsidian's structure
+            entities = {"places": [], "topics": [], "people": []}
+            
+            for fact in profile.facts:
+                if fact.category == "Location":
+                    entities["places"].append({"name": fact.value, "context": fact.source_quote})
+                elif fact.category == "Interest":
+                    entities["topics"].append({"name": fact.value, "context": fact.source_quote})
+                elif fact.category == "Family":
+                    entities["people"].append({"name": fact.value, "context": fact.source_quote})
 
             # Build people note data
             person_data = {
@@ -138,39 +146,25 @@ class ObsidianWriter:
             people_notes.append(person_data)
 
             # Accumulate places and topics across all contacts
-            for place in entities.get("places", []):
-                place_name = place.get("name", "").strip()
-                if not place_name:
-                    continue
+            for place in entities["places"]:
+                place_name = place["name"].strip()
+                if not place_name: continue
                 key = place_name.lower()
                 if key not in all_places:
-                    all_places[key] = {
-                        "name": place_name,
-                        "mentioned_by": [],
-                        "contexts": [],
-                    }
+                    all_places[key] = {"name": place_name, "mentioned_by": [], "contexts": []}
                 all_places[key]["mentioned_by"].append(contact_name)
                 if place.get("context"):
-                    all_places[key]["contexts"].append(
-                        f"{contact_name}: {place['context']}"
-                    )
+                    all_places[key]["contexts"].append(f"{contact_name}: {place['context']}")
 
-            for topic in entities.get("topics", []):
-                topic_name = topic.get("name", "").strip()
-                if not topic_name:
-                    continue
+            for topic in entities["topics"]:
+                topic_name = topic["name"].strip()
+                if not topic_name: continue
                 key = topic_name.lower()
                 if key not in all_topics:
-                    all_topics[key] = {
-                        "name": topic_name,
-                        "mentioned_by": [],
-                        "contexts": [],
-                    }
+                    all_topics[key] = {"name": topic_name, "mentioned_by": [], "contexts": []}
                 all_topics[key]["mentioned_by"].append(contact_name)
                 if topic.get("context"):
-                    all_topics[key]["contexts"].append(
-                        f"{contact_name}: {topic['context']}"
-                    )
+                    all_topics[key]["contexts"].append(f"{contact_name}: {topic['context']}")
 
         # Write all notes
         people_count = 0
@@ -246,6 +240,8 @@ class ObsidianWriter:
             "",
             f"# {name}",
             "",
+            f"> {profile.summary}",
+            "",
         ]
 
         # Facts section
@@ -253,17 +249,14 @@ class ObsidianWriter:
             lines.append("## Known Facts")
             lines.append("")
             for fact in profile.facts:
-                category = fact.get("category", "Other")
-                value = fact.get("value", "")
-                confidence = fact.get("confidence", "")
-                source = fact.get("source_quote", "")
-
-                line = f"- **{category}**: {value}"
-                if confidence:
-                    line += f" `({confidence})`"
+                line = f"- **{fact.category}**: {fact.value}"
+                if fact.confidence:
+                    line += f" `({fact.confidence})`"
+                if not fact.is_first_party:
+                    line += " ℹ️" # Mark 3rd party facts
                 lines.append(line)
-                if source:
-                    lines.append(f"  - > \"{source}\"")
+                if fact.source_quote:
+                    lines.append(f"  - > \"{fact.source_quote}\"")
             lines.append("")
 
         # Relationships section
@@ -329,6 +322,9 @@ class ObsidianWriter:
             for link in topic_links:
                 lines.append(f"- {link}")
             lines.append("")
+        
+        # We can still add a relationships section if we want to preserve that format,
+        # but for now let's focus on the consolidated entities.
 
         # Recent messages snippet
         messages = person.get("messages", [])
@@ -501,75 +497,4 @@ class ObsidianWriter:
 
         return messages
 
-    # ------------------------------------------------------------------
-    # LLM entity extraction
-    # ------------------------------------------------------------------
-
-    def _extract_entities(
-        self, contact_name: str, messages: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        """Extract entities and relationships from a contact's messages."""
-        if not messages:
-            return {"people": [], "places": [], "topics": [], "events": [], "relationships": []}
-
-        # Format messages for the prompt  
-        formatted = []
-        for msg in messages[-50:]:
-            ts = msg.get("timestamp", "")[:10]
-            text = msg.get("text", "")
-            is_self = msg.get("is_self", False)
-            sender = "You" if is_self else msg.get("sender_name", "?")
-            chat = msg.get("chat_name", "")
-            formatted.append(f"[{ts}] ({chat}) {sender}: {text}")
-
-        base_prompt = ENTITY_EXTRACTION_PROMPT.format(
-            contact_name=contact_name,
-            messages="\n".join(formatted),
-        )
-
-        prompt = base_prompt
-        max_retries = 2
-        
-        for attempt in range(max_retries):
-            response = self._call_ollama(prompt)
-            if not response:
-                break
-
-            try:
-                json_start = response.find("{")
-                json_end = response.rfind("}") + 1
-                if json_start == -1 or json_end == 0:
-                    raise ValueError("No JSON object found in response")
-                result = json.loads(response[json_start:json_end])
-                return result
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Failed to parse entity extraction for {contact_name} on attempt {attempt+1}: {e}")
-                if attempt < max_retries - 1:
-                    prompt = base_prompt + f"\n\nERROR: The previous response was invalid JSON: {str(e)}. Please try again and return ONLY valid JSON. Make sure to properly escape quotes within strings (using \\\"), remove any trailing commas, and preserve the original message quotes perfectly."
-                else:
-                    logger.error(f"Giving up on {contact_name} after {max_retries} attempts.")
-
-        return {"people": [], "places": [], "topics": [], "events": [], "relationships": []}
-
-    def _call_ollama(self, prompt: str) -> str:
-        """Call Ollama's generate endpoint."""
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.post(
-                    f"{self._ollama_url}/api/generate",
-                    json={
-                        "model": self._model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                        "options": {
-                            "temperature": 0.1,
-                            "num_predict": 2048,
-                        },
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json().get("response", "")
-        except Exception as e:
-            logger.error(f"Ollama call failed: {e}")
-            return ""
+    # Removed _extract_entities to consolidate extraction into ProfileExtractor.

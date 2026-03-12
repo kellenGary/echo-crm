@@ -203,25 +203,21 @@ class ChatBot:
         return "\n".join(lines)
 
     def _handle_sync_command(self) -> str:
-        """Run a message sync + extraction."""
+        """Run a message sync + indexing + extraction."""
         try:
-            from message_logger import MessageLogger
-            from profile_extractor import ProfileExtractor
+            from main import cmd_sync, cmd_index, cmd_extract
 
-            ml = MessageLogger(self._client)
-            new_count = ml.sync_all()
-
-            extractor = ProfileExtractor()
-            updated = extractor.extract_profiles()
+            # Run sync
+            cmd_sync()
+            # Run indexing (new!)
+            cmd_index()
+            # Run extraction
+            cmd_extract()
 
             # Refresh query engine with new data
             self._engine = QueryEngine()
 
-            return (
-                f"✅ Sync complete!\n\n"
-                f"• **{new_count}** new messages logged\n"
-                f"• **{updated}** contacts updated"
-            )
+            return "✅ Sync, indexing, and extraction complete!"
         except Exception as e:
             logger.error(f"Sync failed: {e}")
             return f"❌ Sync failed: {e}"
