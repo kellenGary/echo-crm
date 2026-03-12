@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Data and logs
+data/
+*.log
+*.jsonl
+*.db
+*.sqlite
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Obsidian vault output (if applicable)
+Obsidian*/
