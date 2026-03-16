@@ -205,14 +205,15 @@ class ChatBot:
     def _handle_sync_command(self) -> str:
         """Run a message sync + indexing + extraction."""
         try:
+            import asyncio
             from main import cmd_sync, cmd_index, cmd_extract
 
             # Run sync
             cmd_sync()
             # Run indexing (new!)
             cmd_index()
-            # Run extraction
-            cmd_extract()
+            # Run extraction (Async)
+            asyncio.run(cmd_extract())
 
             # Refresh query engine with new data
             self._engine = QueryEngine()

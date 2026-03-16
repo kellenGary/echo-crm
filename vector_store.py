@@ -20,20 +20,47 @@ class OllamaEmbeddingFunction:
         self.base_url = base_url
 
     def __call__(self, input: List[str]) -> List[List[float]]:
-        embeddings = []
-        try:
-            with httpx.Client(timeout=60.0) as client:
-                for text in input:
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def get_one(text: str) -> List[float]:
+            try:
+                # Use the newer /api/embed endpoint which is more robust
+                with httpx.Client(timeout=60.0) as client:
                     resp = client.post(
-                        f"{self.base_url}/api/embeddings",
-                        json={"model": self.model_name, "prompt": text},
+                        f"{self.base_url}/api/embed",
+                        json={"model": self.model_name, "input": text},
                     )
-                    resp.raise_for_status()
-                    embeddings.append(resp.json()["embedding"])
-            return embeddings
-        except Exception as e:
-            logger.error(f"Failed to get embeddings from Ollama: {e}")
-            return [[0.0] * 768 for _ in input]
+                    if resp.status_code != 200:
+                        logger.error(f"Ollama embedding error ({resp.status_code}): {resp.text}")
+                        resp.raise_for_status()
+                    
+                    data = resp.json()
+                    # /api/embed returns {"embeddings": [[...]]}
+                    if "embeddings" in data:
+                        return data["embeddings"][0]
+                    # Fallback to older /api/embeddings format if needed
+                    elif "embedding" in data:
+                        return data["embedding"]
+                    else:
+                        logger.error(f"Unexpected response format from Ollama: {data}")
+                        return [0.0] * 768
+            except Exception as e:
+                logger.error(f"Failed to get embedding from Ollama model '{self.model_name}': {e}")
+                return [0.0] * 768
+
+        # Parallelize embedding calls
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            embeddings = list(executor.map(get_one, input))
+            
+        return embeddings
+
+    def embed_query(self, input: str) -> List[float]:
+        """Embed a single query string (supporting 'input' keyword)."""
+        return self.__call__([input])[0]
+
+    def embed_documents(self, input: List[str]) -> List[List[float]]:
+        """Embed a list of document strings (supporting 'input' keyword)."""
+        return self.__call__(input)
 
     def name(self) -> str:
         return "ollama"

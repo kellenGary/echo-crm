@@ -202,144 +202,106 @@ class ObsidianWriter:
         all_places: dict[str, dict],
         all_topics: dict[str, dict],
     ):
-        """Write an Obsidian note for a person."""
+        """Write a beautiful Obsidian note for a person based on Format File.md."""
         profile = person["profile"]
-        entities = person["entities"]
         name = person["name"]
         safe_name = _sanitize_filename(name)
 
-        # Build wiki-links for related entities
-        place_links = []
-        for p in entities.get("places", []):
-            pname = p.get("name", "").strip()
-            if pname:
-                place_links.append(f"[[{_sanitize_filename(pname)}]]")
+        # Organize facts by template sections
+        sections = {
+            "identity": [],
+            "biographical": [],
+            "professional": [],
+            "interest": [],
+            "social": []
+        }
+        
+        # Frontmatter variables
+        fm = {
+            "aliases": [],
+            "tags": ["contact", "beeper"],
+            "relationship": "Contact",
+            "location": "Unknown",
+            "company": "Unknown",
+            "role": "Unknown",
+            "birthday": "Unknown"
+        }
 
-        topic_links = []
-        for t in entities.get("topics", []):
-            tname = t.get("name", "").strip()
-            if tname:
-                topic_links.append(f"[[{_sanitize_filename(tname)}]]")
+        for fact in profile.facts:
+            cat = fact.category.lower()
+            val = fact.value
+            
+            # Map categories to sections
+            if "identity" in cat: sections["identity"].append(fact)
+            elif "biographical" in cat or "location" in cat or "education" in cat: sections["biographical"].append(fact)
+            elif "professional" in cat or "work" in cat: sections["professional"].append(fact)
+            elif "interest" in cat or "hobby" in cat: sections["interest"].append(fact)
+            elif "social" in cat or "family" in cat or "relationship" in cat: sections["social"].append(fact)
+            else: sections["interest"].append(fact) # Fallback
 
-        people_links = []
-        for p in entities.get("people", []):
-            pname = p.get("name", "").strip()
-            if pname and pname != name:
-                people_links.append(f"[[{_sanitize_filename(pname)}]]")
+            # Fill frontmatter if possible
+            if "location" in cat: fm["location"] = val
+            if "work" in cat or "company" in cat: fm["company"] = val
+            if "role" in cat: fm["role"] = val
+            if "birthday" in cat: fm["birthday"] = val
+            if "identity" in cat and "name" in cat: fm["aliases"].append(val)
+            if "social" in cat and "relation" in cat: fm["relationship"] = val
 
         # YAML frontmatter
         lines = [
             "---",
-            f"type: person",
-            f"name: \"{name}\"",
-            f"contact_id: \"{person['contact_id']}\"",
-            f"messages_analyzed: {profile.message_count}",
+            f"aliases: {json.dumps(fm['aliases'])}",
+            f"tags: {json.dumps(fm['tags'])}",
+            f"relationship: \"{fm['relationship']}\"",
+            f"location: \"{fm['location']}\"",
+            f"company: \"{fm['company']}\"",
+            f"role: \"{fm['role']}\"",
+            f"birthday: \"{fm['birthday']}\"",
             f"last_updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-            f"tags: [beeper, contact]",
             "---",
             "",
             f"# {name}",
             "",
-            f"> {profile.summary}",
+            f"> **Quick Summary:**",
+            f"> {profile.summary if profile.summary else 'No summary available yet.'}",
             "",
+            "## 🪪 Identity & Bio",
         ]
 
-        # Facts section
-        if profile.facts:
-            lines.append("## Known Facts")
-            lines.append("")
-            for fact in profile.facts:
-                line = f"- **{fact.category}**: {fact.value}"
-                if fact.confidence:
-                    line += f" `({fact.confidence})`"
-                if not fact.is_first_party:
-                    line += " ℹ️" # Mark 3rd party facts
+        def add_section_facts(fact_list):
+            if not fact_list:
+                lines.append("* No details recorded yet.")
+            for f in fact_list:
+                line = f"* **{f.category}:** {f.value}"
+                if not f.is_first_party:
+                    line += " ℹ️"
                 lines.append(line)
-                if fact.source_quote:
-                    lines.append(f"  - > \"{fact.source_quote}\"")
-            lines.append("")
 
-        # Relationships section
-        relationships = entities.get("relationships", [])
-        if relationships:
-            lines.append("## Relationships")
-            lines.append("")
-            for rel in relationships:
-                from_e = rel.get("from", "")
-                to_e = rel.get("to", "")
-                rel_type = rel.get("type", "related to")
-                context = rel.get("context", "")
+        add_section_facts(sections["identity"] + sections["biographical"])
 
-                to_safe = _sanitize_filename(to_e)
-                from_safe = _sanitize_filename(from_e)
+        lines.append("\n## 💼 Professional")
+        add_section_facts(sections["professional"])
 
-                if from_e.lower() == name.lower():
-                    lines.append(f"- **{rel_type}** → [[{to_safe}]]")
-                elif to_e.lower() == name.lower():
-                    lines.append(f"- [[{from_safe}]] **{rel_type}** → this person")
-                else:
-                    lines.append(f"- [[{from_safe}]] **{rel_type}** [[{to_safe}]]")
+        lines.append("\n## 🎯 Interests & Hobbies")
+        add_section_facts(sections["interest"])
 
-                if context:
-                    lines.append(f"  - {context}")
-            lines.append("")
+        lines.append("\n## 🤝 Social Context")
+        add_section_facts(sections["social"])
 
-        # Events
-        events = entities.get("events", [])
-        if events:
-            lines.append("## Events")
-            lines.append("")
-            for event in events:
-                event_name = event.get("name", "")
-                date = event.get("date", "")
-                context = event.get("context", "")
-                line = f"- **{event_name}**"
-                if date:
-                    line += f" ({date})"
-                lines.append(line)
-                if context:
-                    lines.append(f"  - {context}")
-            lines.append("")
+        lines.append("\n---")
+        lines.append("## 📝 Extraction Log")
+        lines.append("*Keep a running log of the raw facts extracts.*")
+        lines.append("")
 
-        # Connected entities
-        if people_links:
-            lines.append("## Connected People")
-            lines.append("")
-            for link in people_links:
-                lines.append(f"- {link}")
-            lines.append("")
+        # Sorted log
+        sorted_facts = sorted(profile.facts, key=lambda x: x.extracted_at, reverse=True)
+        for f in sorted_facts:
+            date_str = f.extracted_at[:10]
+            party_str = "First-party" if f.is_first_party else "Third-party"
+            lines.append(f"- **[{date_str}]** `{f.category}` - \"{f.source_quote}\" → **{f.value}** (Confidence: {f.confidence.capitalize()}) | *{party_str}*")
 
-        if place_links:
-            lines.append("## Places")
-            lines.append("")
-            for link in place_links:
-                lines.append(f"- {link}")
-            lines.append("")
-
-        if topic_links:
-            lines.append("## Interests & Topics")
-            lines.append("")
-            for link in topic_links:
-                lines.append(f"- {link}")
-            lines.append("")
+        lines.append("")
         
-        # We can still add a relationships section if we want to preserve that format,
-        # but for now let's focus on the consolidated entities.
-
-        # Recent messages snippet
-        messages = person.get("messages", [])
-        if messages:
-            lines.append("## Recent Messages")
-            lines.append("")
-            for msg in messages[-10:]:
-                ts = msg.get("timestamp", "")[:10]
-                text = msg.get("text", "")
-                sender = msg.get("sender_name", "?")
-                is_self = msg.get("is_self", False)
-                who = "You" if is_self else sender
-                lines.append(f"> **{who}** ({ts}): {text}")
-                lines.append("")
-
         filepath = self._people_dir / f"{safe_name}.md"
         filepath.write_text("\n".join(lines), encoding="utf-8")
 
@@ -474,7 +436,7 @@ class ObsidianWriter:
     # ------------------------------------------------------------------
 
     def _load_messages_by_contact(self) -> dict[str, list[dict[str, Any]]]:
-        """Load raw messages grouped by sender_id."""
+        """Load raw messages grouped by sender_id or sender_name."""
         messages: dict[str, list[dict[str, Any]]] = {}
         if not config.RAW_LOG_FILE.exists():
             return messages
@@ -486,14 +448,18 @@ class ObsidianWriter:
                     continue
                 try:
                     record = json.loads(line)
+                    # Use sender_id if available, fallback to name
+                    # For self messages, ensure they go to config.MY_NAME's bucket
+                    if record.get("is_self"):
+                        sender_key = config.MY_NAME
+                    else:
+                        sender_key = record.get("sender_id", record.get("sender_name", "unknown"))
+                    
+                    if sender_key not in messages:
+                        messages[sender_key] = []
+                    messages[sender_key].append(record)
                 except json.JSONDecodeError:
                     continue
-
-                # Group by sender_name to merge text messages and Beeper messages
-                sender_name = record.get("sender_name", record.get("sender_id", ""))
-                if sender_name not in messages:
-                    messages[sender_name] = []
-                messages[sender_name].append(record)
 
         return messages
 

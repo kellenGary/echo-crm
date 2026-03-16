@@ -77,21 +77,36 @@ async def cmd_extract(force_all: bool = False) -> int:
 
 
 def cmd_index() -> int:
-    """Index all logged messages into the vector store."""
-    logger.info("Starting vector indexing...")
+    """Index all logged messages into the vector store incrementally."""
+    logger.info("Starting incremental vector indexing...")
     if not config.RAW_LOG_FILE.exists():
         logger.warning(f"No log file found at {config.RAW_LOG_FILE}. Sync messages first.")
         return 1
 
+    # Load last indexed line number
+    last_indexed = 0
+    if config.VECTOR_STATE_FILE.exists():
+        try:
+            with open(config.VECTOR_STATE_FILE) as f:
+                last_indexed = json.load(f).get("last_indexed_line", 0)
+        except Exception:
+            pass
+
     vs = VectorStore()
     
-    # Load all messages from log
+    batch_size = 100
     messages = []
+    current_line = 0
+    total_new = 0
+
     with open(config.RAW_LOG_FILE) as f:
-        for line in f:
+        for i, line in enumerate(f):
+            current_line = i + 1
+            if current_line <= last_indexed:
+                continue
+
             try:
                 msg = json.loads(line)
-                # Map message record to what VectorStore expects
                 messages.append({
                     "id": msg["message_id"],
                     "text": msg["text"],
@@ -102,14 +117,28 @@ def cmd_index() -> int:
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
+            
+            # Process in batches
+            if len(messages) >= batch_size:
+                logger.info(f"Indexing batch ending at line {current_line}...")
+                vs.index_messages(messages)
+                total_new += len(messages)
+                messages = []
+                # Save progress frequently
+                with open(config.VECTOR_STATE_FILE, "w") as f:
+                    json.dump({"last_indexed_line": current_line}, f)
 
-    if not messages:
-        logger.warning("No messages found in log to index.")
-        return 0
+    # Process remaining messages
+    if messages:
+        vs.index_messages(messages)
+        total_new += len(messages)
+        with open(config.VECTOR_STATE_FILE, "w") as f:
+            json.dump({"last_indexed_line": current_line}, f)
 
-    logger.info(f"Indexing {len(messages)} messages...")
-    vs.index_messages(messages)
-    logger.info(f"✓ Indexing complete — Total items: {vs.get_indexed_count()}")
+    if total_new > 0:
+        logger.info(f"✓ Indexing complete — {total_new} new items indexed. Total: {vs.get_indexed_count()}")
+    else:
+        logger.info("No new messages to index.")
     return 0
 
 
@@ -166,11 +195,12 @@ def cmd_contacts():
 
 
 async def cmd_run():
-    """Full pipeline: sync → index → extract → ask."""
+    """Full pipeline: sync → index → extract → obsidian → ask."""
     if cmd_sync() != 0:
         return
     cmd_index()
     await cmd_extract()
+    cmd_obsidian()
     cmd_ask()
 
 
@@ -186,6 +216,7 @@ async def cmd_daemon():
             cmd_sync()
             cmd_index()
             await cmd_extract()
+            cmd_obsidian()
             logger.info(
                 f"Sleeping {config.SYNC_INTERVAL_SECONDS}s until next sync..."
             )
