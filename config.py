@@ -14,12 +14,12 @@ BEEPER_API_TOKEN = os.getenv("BEEPER_API_TOKEN", "7160b021-e5a0-4c29-8c3f-816f31
 
 # --- Ollama LLM ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 # --- Extraction Performance ---
 EXTRACTION_BATCH_SIZE = int(os.getenv("EXTRACTION_BATCH_SIZE", "50"))
-EXTRACTION_CONCURRENCY = int(os.getenv("EXTRACTION_CONCURRENCY", "2"))
+EXTRACTION_CONCURRENCY = int(os.getenv("EXTRACTION_CONCURRENCY", "4"))
 
 # --- Data Storage ---
 DATA_DIR = Path(os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")))

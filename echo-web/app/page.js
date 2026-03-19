@@ -1,64 +1,35 @@
-'use client';
+import fs from 'fs';
+import path from 'path';
+import Dashboard from './Dashboard';
 
-import { useState, useEffect } from 'react';
+export const dynamic = 'force-dynamic';
 
-export default function Home() {
-  const [contacts, setContacts] = useState([]);
-  const [loading, setLoading] = useState(true);
+export default async function Home() {
+  let contacts = [];
+  let discoveries = [];
 
-  useEffect(() => {
-    async function fetchData() {
-      try {
-        const response = await fetch('/api/contacts');
-        const data = await response.json();
-        setContacts(data);
-      } catch (error) {
-        console.error('Error fetching data:', error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    fetchData();
-  }, []);
+  try {
+    // Fetch from our local FastAPI backend
+    const apiHost = process.env.BACKEND_URL || 'http://localhost:8000';
+    console.log(`[Next.js] Fetching data from ${apiHost}...`);
+    
+    const [contactsRes, discoveriesRes] = await Promise.all([
+      fetch(`${apiHost}/api/contacts`, { cache: 'no-store' }),
+      fetch(`${apiHost}/api/discoveries`, { cache: 'no-store' })
+    ]);
+    
+    if (contactsRes.ok) contacts = await contactsRes.json();
+    if (discoveriesRes.ok) discoveries = await discoveriesRes.json();
+    
+    console.log(`[Next.js] Successfully loaded ${contacts.length} contacts and ${discoveries.length} discoveries.`);
+  } catch (err) {
+    console.error('❌ [Next.js] Error connecting to API:', err.message);
+    console.error('   Make sure the FastAPI backend is running on http://localhost:8000');
+  }
 
   return (
-    <main className="main-container">
-      <header className="header">
-        <div>
-          <h1 className="title">Echo CRM</h1>
-          <p style={{ color: 'var(--muted-foreground)' }}>Next.js + Python Hybrid System</p>
-        </div>
-        <div style={{ padding: '0.5rem 1rem', background: 'var(--muted)', borderRadius: 'var(--radius)', fontSize: '0.875rem' }}>
-          {contacts.length} Profiles Synced
-        </div>
-      </header>
-
-      {loading ? (
-        <div style={{ textAlign: 'center', padding: '4rem' }}>Loading intelligence...</div>
-      ) : (
-        <div className="grid">
-          {contacts.map((contact) => (
-            <div key={contact.contact_id} className="card">
-              <h2 className="card-title">{contact.display_name}</h2>
-              <div style={{ marginBottom: '1rem', fontSize: '0.875rem', color: 'var(--muted-foreground)' }}>
-                {contact.message_count} messages analyzed
-              </div>
-              
-              <div style={{ display: 'flex', flexWrap: 'wrap', margin: '-0.25rem' }}>
-                {contact.facts?.map((fact, i) => (
-                  <span key={i} className="fact-badge">
-                    {fact.category}: {fact.value}
-                  </span>
-                ))}
-              </div>
-              
-              <div style={{ marginTop: '1.5rem', paddingTop: '1rem', borderTop: '1px solid var(--border)', fontSize: '0.75rem', color: 'var(--muted-foreground)' }}>
-                Last activity: {new Date(contact.last_updated).toLocaleDateString()}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+    <main className="flex-1 min-h-0 overflow-y-auto">
+      <Dashboard initialContacts={contacts} discoveries={discoveries} />
     </main>
   );
 }

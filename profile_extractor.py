@@ -8,6 +8,7 @@ import httpx
 from pydantic import ValidationError
 import config
 from models import ContactProfile, ExtractionResult, Fact
+from storage import DataStore
 
 logger = logging.getLogger(__name__)
 
@@ -15,15 +16,28 @@ EXTRACTION_PROMPT = """\
 You are an expert personal intelligence analyst. Your goal is to build a rich, accurate, and non-redundant profile of contacts based on chat history.
 
 ## Context
-Sender: **{sender_name}** ({sender_id})
-Messages:
+Current Date: {current_date}
+User (You): **{my_name}**
+Primary Contact (The person you are talking to): **{sender_name}** ({sender_id})
+
+## Chat History
 {messages_block}
 
 ## Task & Instructions
-1. **Analyze Context:** Read the chat history carefully. Track the flow of conversation to resolve pronouns (who "he", "she", or "they" refers to).
-2. **Decode Slang & Infer:** Translate slang, shorthand, or emojis into formal, concrete facts. Use strong contextual inference.
-3. **Extract Facts:** Identify concrete, meaningful facts about the Sender OR anyone else mentioned. 
-4. **Determine Source:** Identify if the information is first-party (Self) or third-party.
+1. **Analyze Context & Time:** Read the chat history carefully. Use the [YYYY-MM-DD HH:MM] timestamps for each message.
+   - If a message mentions "yesterday", "tomorrow", or "next week", use the message's timestamp to determine the actual date.
+   - Facts should be anchored in time if possible (e.g., "Visited Japan in June 2024").
+2. **Distinguish Senders (CRITICAL):**
+    - Messages from **{my_name}** are YOUR messages.
+    - Messages from **{sender_name}** are the CONTACT's messages.
+    - **SENDER IDENTIFICATION:** The name at the start of each message line (e.g. `[{my_name}]: ...`) is the person who SPOKE those words. 
+    - If a person says "I work at...", that fact applies to the SENDER of that message.
+    - DO NOT attribute facts about {my_name} to {sender_name} or vice-versa. 
+    - When extracting a fact about the Primary Contact, use their name "**{sender_name}**" as the subject_name.
+    - When extracting a fact about yourself, use "**{my_name}**" as the subject_name.
+3. **Decode Slang & Infer:** Translate slang, shorthand, or emojis into formal, concrete facts. Use strong contextual inference.
+4. **Extract Facts:** Identify concrete, meaningful facts about the Primary Contact, Yourself, or anyone else mentioned. 
+5. **Determine Source:** Identify if the information is first-party (Self - the person spoke it about themselves) or third-party (someone else spoke it about them).
 
 ## Category Guide
 - **Identity**: Full name, aliases, family role.
@@ -33,23 +47,31 @@ Messages:
 - **Social**: Relationships (e.g., "John is the brother").
 
 ## CRITICAL RULES
-- **THINK FIRST:** Use the "reasoning_scratchpad" to analyze context BEFORE outputting facts.
-- **NO FILLERS:** DO NOT output facts with values like "Unknown".
-- **EXACT NAMES:** Use actual names or "{sender_name}".
+- **THINK FIRST:** Use the "reasoning_scratchpad" to analyze context and timestamps BEFORE outputting facts.
+- **NO MIXING:** Be extremely careful to attribute facts to the correct person. 
+- **FIRST-PERSON PRONOUNS:** If {my_name} says "I am a doctor", then {my_name} is the doctor. If {sender_name} says "I am a doctor", then {sender_name} is the doctor.
 - **JSON ONLY:** Output nothing but valid JSON.
 
 ## Output Format
 {{
-  "reasoning_scratchpad": "Brief analysis and slang decoding.",
-  "summary_of_sender": "1-2 sentence overview.",
+  "reasoning_scratchpad": "Brief analysis of conversation flow, timestamp resolution, and slang decoding.",
+  "summary_of_sender": "1-2 sentence overview of the Primary Contact ({sender_name}) only.",
   "extractions": [
     {{
-      "subject_name": "Actual Name",
+      "subject_name": "Actual Name (e.g. {sender_name} or {my_name})",
       "category": "Identity|Biographical|Professional|Interest|Social",
-      "value": "The fact",
+      "value": "The fact (include temporal context if available)",
       "confidence": "high|medium|low",
       "source_quote": "Snippet",
       "is_first_party": true
+    }}
+  ],
+  "relationships": [
+    {{
+      "target_name": "Person/Place Name",
+      "type": "friend|family|colleague|works_at|lives_in",
+      "context": "Brief context including dates if mentioned",
+      "confidence": "high|medium|low"
     }}
   ]
 }}
@@ -59,7 +81,8 @@ class ProfileExtractor:
     def __init__(self):
         self._ollama_url = config.OLLAMA_BASE_URL
         self._model = config.OLLAMA_MODEL
-        self._profiles: dict[str, ContactProfile] = self._load_profiles()
+        self._store = DataStore(config.DATA_DIR / "echo_nosql.json")
+        self._profiles: dict[str, ContactProfile] = self._store.get_all_profiles()
         self._processed_line_count = self._get_processed_count()
         # Use config or default to 2 for safety with 14B
         concurrency = getattr(config, "EXTRACTION_CONCURRENCY", 2)
@@ -82,10 +105,18 @@ class ProfileExtractor:
         return profiles
 
     def _save_profiles(self, processed_lines: int):
+        # Save to NoSQL Store
+        for profile in self._profiles.values():
+            self._store.save_profile(profile)
+
+        # Run Fact Resolver Analytic
+        discoveries = self._store.get_shared_intelligence()
+
         data = {
             "contacts": {
                 cid: profile.model_dump() for cid, profile in self._profiles.items()
             },
+            "discoveries": discoveries, 
             "last_extraction": datetime.now(timezone.utc).isoformat(),
             "total_contacts": len(self._profiles),
             "processed_lines": processed_lines
@@ -113,31 +144,60 @@ class ProfileExtractor:
             logger.warning("No message log found. Run a sync first.")
             return 0
 
-        messages_by_chat: dict[str, list[dict[str, Any]]] = {}
-        current_line = 0
+        total_updated = 0
+        batch_size_lines = 500 
+        current_batch_lines = []
+        current_line_num = 0
         
-        logger.info("Scanning message log...")
-        with open(config.RAW_LOG_FILE) as f:
-            for i, line in enumerate(f):
-                current_line = i + 1
-                if not force_all and current_line <= self._processed_line_count:
-                    continue
+        logger.info(f"Starting extraction from line {self._processed_line_count}...")
 
-                line = line.strip()
-                if not line: continue
-                try:
-                    record = json.loads(line)
-                    chat_id = record.get("chat_id", "unknown")
-                    if chat_id not in messages_by_chat:
-                        messages_by_chat[chat_id] = []
-                    messages_by_chat[chat_id].append(record)
-                except json.JSONDecodeError:
+        with open(config.RAW_LOG_FILE, "r") as f:
+            for i, line in enumerate(f):
+                current_line_num = i + 1
+                
+                # Skip already processed lines unless forced
+                if not force_all and current_line_num <= self._processed_line_count:
                     continue
+                
+                current_batch_lines.append(line)
+                
+                # Process batch when it reaches the limit
+                if len(current_batch_lines) >= batch_size_lines:
+                    logger.info(f"--- Processing Batch (Lines {current_line_num - batch_size_lines + 1} to {current_line_num}) ---")
+                    batch_updated = await self._process_line_batch(current_batch_lines)
+                    total_updated += batch_updated
+                    
+                    # Update checkpoint
+                    self._processed_line_count = current_line_num
+                    self._save_profiles(current_line_num)
+                    current_batch_lines = []
+            
+            # Process remaining lines
+            if current_batch_lines:
+                logger.info(f"--- Processing Final Batch (Lines up to {current_line_num}) ---")
+                batch_updated = await self._process_line_batch(current_batch_lines)
+                total_updated += batch_updated
+                self._processed_line_count = current_line_num
+                self._save_profiles(current_line_num)
+
+        return total_updated
+
+    async def _process_line_batch(self, lines: list[str]) -> int:
+        """Process a specific subset of lines and return number of updated contacts."""
+        messages_by_chat: dict[str, list[dict[str, Any]]] = {}
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            try:
+                record = json.loads(line)
+                chat_id = record.get("chat_id", "unknown")
+                if chat_id not in messages_by_chat:
+                    messages_by_chat[chat_id] = []
+                messages_by_chat[chat_id].append(record)
+            except json.JSONDecodeError:
+                continue
 
         if not messages_by_chat:
-            logger.info("No new messages to process")
-            self._processed_line_count = current_line
-            self._save_profiles(current_line)
             return 0
 
         all_tasks_metadata = []
@@ -149,7 +209,7 @@ class ProfileExtractor:
             
             other_participants = list(set(
                 m.get("sender_name") for m in meaningful 
-                if m.get("sender_name") and m.get("sender_name") != config.MY_NAME
+                if m.get("sender_name") and not m.get("is_self", False)
             ))
             other_name = other_participants[0] if other_participants else "Unknown"
             chat_name = meaningful[0].get("chat_name", other_name)
@@ -163,7 +223,10 @@ class ProfileExtractor:
                 })
 
         total_tasks = len(all_tasks_metadata)
-        logger.info(f"Starting {total_tasks} extraction tasks incrementally...")
+        if total_tasks == 0:
+            return 0
+
+        logger.info(f"  Batch Tasks: {total_tasks} chunks")
         
         contacts_updated_set = set()
         completed_count = 0
@@ -177,7 +240,6 @@ class ProfileExtractor:
                 )
                 return metadata, res
 
-        # Process as they complete
         pending = [asyncio.ensure_future(process_task(m)) for m in all_tasks_metadata]
         
         for future in asyncio.as_completed(pending):
@@ -198,28 +260,31 @@ class ProfileExtractor:
                     if not subj_name: continue
                     
                     target_profile = None
-                    if subj_name.lower() in ["self", config.MY_NAME.lower(), "{sender_name}".lower()]:
+                    if subj_name.lower() in ["self", config.MY_NAME.lower()]:
                         target_profile = self._get_or_create_profile(config.MY_NAME, config.MY_NAME)
                         fact.is_first_party = True
+                    elif subj_name.lower() == partner_name.lower():
+                        target_profile = self._get_or_create_profile(partner_id, partner_name)
                     else:
                         target_profile = self.get_profile(subj_name)
                         if not target_profile:
                             target_profile = self._get_or_create_profile(subj_name, subj_name)
                     
-                    target_profile.add_fact(fact)
-                    target_profile.message_count += 1
-                    contacts_updated_set.add(target_profile.contact_id)
+                    if target_profile:
+                        target_profile.add_fact(fact)
+                        target_profile.message_count += 1
+                        contacts_updated_set.add(target_profile.contact_id)
 
-            # Log progress every 5 tasks and save every 10
-            if completed_count % 5 == 0 or completed_count == total_tasks:
+                for rel in extraction_result.relationships:
+                    partner_profile = self._get_or_create_profile(partner_id, partner_name)
+                    partner_profile.add_relationship(rel)
+                    contacts_updated_set.add(partner_profile.contact_id)
+
+            # Progress log for the current batch
+            if completed_count % 10 == 0 or completed_count == total_tasks:
                 progress = (completed_count / total_tasks) * 100
-                logger.info(f"Progress: {progress:.2f}% ({completed_count}/{total_tasks}) | {len(contacts_updated_set)} contacts updated")
-            
-            if completed_count % 10 == 0:
-                self._save_profiles(self._processed_line_count)
+                logger.debug(f"  Batch Progress: {progress:.1f}% ({completed_count}/{total_tasks})")
 
-        self._processed_line_count = current_line
-        self._save_profiles(current_line)
         return len(contacts_updated_set)
 
     def _get_or_create_profile(self, contact_id: str, display_name: str) -> ContactProfile:
@@ -231,11 +296,17 @@ class ProfileExtractor:
         formatted_messages = []
         for msg in messages:
             ts = msg.get("timestamp", "")[:16]
-            sender = msg.get("sender_name", "Unknown")
+            is_self = msg.get("is_self", False)
+            
+            # Use the EXACT names passed into the prompt context to avoid any naming ambiguity for the model
+            sender_label = config.MY_NAME if is_self else sender_name
+            
             text = msg.get("text", "")
-            formatted_messages.append(f"[{ts}] {sender}: {text}")
+            formatted_messages.append(f"[{ts}] {sender_label}: {text}")
 
         prompt = EXTRACTION_PROMPT.format(
+            current_date=datetime.now().strftime("%Y-%m-%d"),
+            my_name=config.MY_NAME,
             sender_name=sender_name,
             sender_id=sender_id,
             messages_block="\n".join(formatted_messages),

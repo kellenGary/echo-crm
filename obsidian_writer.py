@@ -12,6 +12,7 @@ The resulting graph in Obsidian lets you visually explore connections
 between people, locations, interests, and conversations.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -68,11 +69,21 @@ Messages:
 
 
 def _sanitize_filename(name: str) -> str:
-    """Make a string safe for use as a filename."""
-    # Remove or replace characters that are invalid in filenames
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', name)
+    """Make a string safe for use as a filename and Obsidian wiki-link."""
+    # Remove or replace characters that are invalid in filenames or Obsidian links
+    # Obsidian doesn't like: # ^ [ ] |
+    # Filesystems don't like: < > : " / \ | ? *
+    sanitized = re.sub(r'[<>:"/\\|?*#^\[\]]', '', name)
     sanitized = sanitized.strip('. ')
+    
+    # Truncate to avoid "File name too long" errors (typical limit 255, using 200 for safety)
+    if len(sanitized) > 200:
+        # Append a short hash of the original name to avoid collisions when truncated
+        h = hashlib.md5(name.encode()).hexdigest()[:6]
+        sanitized = sanitized[:193].rstrip() + " " + h
+        
     return sanitized or "Unknown"
+
 
 
 class ObsidianWriter:

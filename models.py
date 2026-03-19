@@ -18,15 +18,25 @@ class Fact(BaseModel):
             return "medium"
         return v.lower()
 
+class Relationship(BaseModel):
+    target_name: str
+    target_id: Optional[str] = None
+    type: str = Field(..., description="friend|colleague|family|knows|works_at|lives_in")
+    context: Optional[str] = None
+    confidence: str = "medium"
+    extracted_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
 class ExtractionResult(BaseModel):
     reasoning_scratchpad: Optional[str] = None
     extractions: list[Fact] = []
+    relationships: list[Relationship] = []
     summary_of_sender: Optional[str] = None
 
 class ContactProfile(BaseModel):
     contact_id: str
     display_name: str
     facts: list[Fact] = []
+    relationships: list[Relationship] = []
     summary: str = ""
     last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message_count: int = 0
@@ -39,16 +49,12 @@ class ContactProfile(BaseModel):
         if not new_fact.value:
             return
 
-        # Deduplication and priority logic
         existing_idx = -1
         for i, f in enumerate(self.facts):
-            # Same category and same value (case-insensitive)
             if f.category == new_fact.category and f.value.lower() == new_fact.value.lower():
                 existing_idx = i
                 break
             
-            # Semantic overwrite: If we have a new 'Work' or 'Location' from the person themselves,
-            # we should replace the old one even if the value is different.
             if new_fact.category in ["Work", "Location", "Biographical"] and f.category == new_fact.category:
                 if not f.is_first_party and new_fact.is_first_party:
                     existing_idx = i
@@ -56,9 +62,6 @@ class ContactProfile(BaseModel):
 
         if existing_idx >= 0:
             existing_fact = self.facts[existing_idx]
-            # Replace if:
-            # 1. New fact is first-party and old one isn't
-            # 2. Both have same party-status but new confidence is higher
             if (new_fact.is_first_party and not existing_fact.is_first_party) or \
                (new_fact.is_first_party == existing_fact.is_first_party and 
                 new_fact.confidence == "high" and existing_fact.confidence != "high"):
@@ -67,3 +70,16 @@ class ContactProfile(BaseModel):
             self.facts.append(new_fact)
 
         self.last_updated = datetime.now(timezone.utc).isoformat()
+
+    def add_relationship(self, rel: Relationship):
+        """Add or update a relationship."""
+        for existing in self.relationships:
+            if existing.target_name.lower() == rel.target_name.lower() and existing.type == rel.type:
+                return # Skip duplicate simple relationships for now
+        self.relationships.append(rel)
+        self.last_updated = datetime.now(timezone.utc).isoformat()
+
+class IntelligenceGraph(BaseModel):
+    nodes: list[dict[str, Any]] = [] # {id, label, type, val}
+    links: list[dict[str, Any]] = [] # {source, target, label}
+    last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

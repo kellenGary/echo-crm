@@ -12,7 +12,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-class OllamaEmbeddingFunction:
+from chromadb import EmbeddingFunction, Documents, Embeddings
+
+class OllamaEmbeddingFunction(EmbeddingFunction):
     """Custom embedding function that calls Ollama's API."""
     
     def __init__(self, model_name: str, base_url: str):
@@ -52,6 +54,7 @@ class OllamaEmbeddingFunction:
         with ThreadPoolExecutor(max_workers=10) as executor:
             embeddings = list(executor.map(get_one, input))
             
+        # Ensure it's a list of lists (Embeddings type)
         return embeddings
 
     def embed_query(self, input: str) -> List[float]:
@@ -136,8 +139,12 @@ class VectorStore:
         Perform semantic search for phrases or questions.
         Returns a list of message objects.
         """
+        # Explicitly embed the query to avoid potential type issues in the Rust bridge
+        # through the default query_texts path in some chromadb versions.
+        query_embeddings = self._embed_fn([query])
+        
         results = self._collection.query(
-            query_texts=[query],
+            query_embeddings=query_embeddings,
             n_results=limit
         )
 
