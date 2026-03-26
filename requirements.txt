@@ -1,0 +1,12 @@
+google-genai
+chromadb
+psycopg2-binary
+python-dotenv
+fastapi
+uvicorn
+tenacity
+requests
+pathlib
+argparse
+asyncio
+jsonpickle
