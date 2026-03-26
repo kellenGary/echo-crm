@@ -2,15 +2,55 @@ import asyncio
 import json
 import logging
 import os
+from filelock import FileLock
 from datetime import datetime, timezone
 from typing import Any
-import httpx
 from pydantic import ValidationError
 import config
-from models import ContactProfile, ExtractionResult, Fact
+from gemini_client import GeminiClient
+from models import ContactProfile, ExtractionResult, Fact, GroupChatSummary
 from storage import DataStore
 
 logger = logging.getLogger(__name__)
+
+# JSON schema for Gemini structured output — matches ExtractionResult
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reasoning_scratchpad": {"type": "string"},
+        "summary_of_sender": {"type": "string"},
+        "extractions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "subject_name": {"type": "string"},
+                    "category": {"type": "string"},
+                    "value": {"type": "string"},
+                    "confidence": {"type": "string"},
+                    "source_quote": {"type": "string"},
+                    "is_first_party": {"type": "boolean"},
+                    "temporal_status": {"type": "string"},
+                },
+                "required": ["subject_name", "category", "value", "confidence", "source_quote", "is_first_party", "temporal_status"],
+            },
+        },
+        "relationships": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "context": {"type": "string"},
+                    "confidence": {"type": "string"},
+                },
+                "required": ["target_name", "type", "context", "confidence"],
+            },
+        },
+    },
+    "required": ["reasoning_scratchpad", "summary_of_sender", "extractions", "relationships"],
+}
 
 EXTRACTION_PROMPT = """\
 You are an expert personal intelligence analyst. Your goal is to build a rich, accurate, and non-redundant profile of contacts based on chat history.
@@ -46,45 +86,85 @@ Primary Contact (The person you are talking to): **{sender_name}** ({sender_id})
 - **Interest**: Hobbies, favorite things.
 - **Social**: Relationships (e.g., "John is the brother").
 
+## Temporal Status (CRITICAL)
+For each fact, determine whether it is **still true today** ({current_date}):
+- `"current"` — The fact is clearly still true (e.g., "I live in Columbus" said recently).
+- `"past"` — The fact was true at the time but is likely no longer true. **Use past tense** in the value field. For example, if someone said "I am sick" 2 years ago, write the value as "Was sick (March 2024)" not "Is sick".
+- `"unknown"` — Cannot determine if the fact is still true.
+
+**Rule of thumb**: If a message is more than 6 months old relative to {current_date}, strongly consider whether the fact is still current or should be marked as "past" with past-tense phrasing. Temporary states (sick, traveling, studying for an exam) should almost always be "past" unless very recent.
+
+## Relationship Rules (CRITICAL)
+- **DO NOT assume strong relationship types from a single mention.** If a person's name is mentioned once in passing, use type `"knows"` with `"medium"` or `"low"` confidence.
+- **Strong types** like `"family"`, `"significant_other"`, or `"brother"` require EXPLICIT statements (e.g., "he's my brother", "she's my girlfriend") — not inference.
+- Use ONE of these types only: `friend`, `family`, `colleague`, `knows`, `works_at`, `lives_in`. Do NOT combine types with pipes (e.g., do NOT write "friend|colleague").
+- Set confidence to `"high"` ONLY when there are multiple messages corroborating the relationship, or an explicit statement.
+
 ## CRITICAL RULES
 - **THINK FIRST:** Use the "reasoning_scratchpad" to analyze context and timestamps BEFORE outputting facts.
 - **NO MIXING:** Be extremely careful to attribute facts to the correct person. 
 - **FIRST-PERSON PRONOUNS:** If {my_name} says "I am a doctor", then {my_name} is the doctor. If {sender_name} says "I am a doctor", then {sender_name} is the doctor.
-- **JSON ONLY:** Output nothing but valid JSON.
-
-## Output Format
-{{
-  "reasoning_scratchpad": "Brief analysis of conversation flow, timestamp resolution, and slang decoding.",
-  "summary_of_sender": "1-2 sentence overview of the Primary Contact ({sender_name}) only.",
-  "extractions": [
-    {{
-      "subject_name": "Actual Name (e.g. {sender_name} or {my_name})",
-      "category": "Identity|Biographical|Professional|Interest|Social",
-      "value": "The fact (include temporal context if available)",
-      "confidence": "high|medium|low",
-      "source_quote": "Snippet",
-      "is_first_party": true
-    }}
-  ],
-  "relationships": [
-    {{
-      "target_name": "Person/Place Name",
-      "type": "friend|family|colleague|works_at|lives_in",
-      "context": "Brief context including dates if mentioned",
-      "confidence": "high|medium|low"
-    }}
-  ]
-}}
 """
+
+# Dedicated prompt for generating executive summaries from a full profile
+EXECUTIVE_SUMMARY_PROMPT = """\
+You are writing an executive summary for a personal CRM contact profile. Based on the extracted facts and relationships below, write a concise 2-4 sentence summary that captures who this person is, what they do, and their key characteristics.
+
+## Contact: {display_name}
+
+## Extracted Facts
+{facts_block}
+
+## Relationships
+{relationships_block}
+
+## Instructions
+- Write in third person (e.g., "{display_name} is a...")
+- Focus on the most important and high-confidence facts
+- Mention their profession, location, and key interests if known
+- If facts are marked as "past", acknowledge them as historical context, not current reality
+- Be concise but comprehensive — this should give someone a quick understanding of who this person is
+- Do NOT include speculative information or low-confidence details
+- Write ONLY the summary paragraph, nothing else — no headers, no bullet points
+"""
+
+EXECUTIVE_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+    },
+    "required": ["summary"],
+}
+
+# Prompt for group chat summarization
+GROUP_CHAT_SUMMARY_PROMPT = """\
+Summarize the following group chat conversation in 2-3 sentences. Focus on the main topics discussed and any plans or decisions made.
+
+## Group Chat: {chat_name}
+## Participants: {participants}
+
+## Messages
+{messages_block}
+
+Write ONLY the summary paragraph, nothing else.
+"""
+
+GROUP_CHAT_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+    },
+    "required": ["summary"],
+}
+
 
 class ProfileExtractor:
     def __init__(self):
-        self._ollama_url = config.OLLAMA_BASE_URL
-        self._model = config.OLLAMA_MODEL
+        self._gemini = GeminiClient()
         self._store = DataStore(config.DATA_DIR / "echo_nosql.json")
         self._profiles: dict[str, ContactProfile] = self._store.get_all_profiles()
+        self._group_chats: dict[str, GroupChatSummary] = {}
         self._processed_line_count = self._get_processed_count()
-        # Use config or default to 2 for safety with 14B
         concurrency = getattr(config, "EXTRACTION_CONCURRENCY", 2)
         self._semaphore = asyncio.Semaphore(concurrency) 
 
@@ -116,18 +196,25 @@ class ProfileExtractor:
             "contacts": {
                 cid: profile.model_dump() for cid, profile in self._profiles.items()
             },
+            "group_chats": {
+                cid: gc.model_dump() for cid, gc in self._group_chats.items()
+            },
             "discoveries": discoveries, 
             "last_extraction": datetime.now(timezone.utc).isoformat(),
             "total_contacts": len(self._profiles),
             "processed_lines": processed_lines
         }
-        temp_file = config.CONTACTS_FILE.with_suffix(".tmp")
+        temp_file = config.CONTACTS_FILE.with_suffix(f".tmp.{os.getpid()}")
+        lock = FileLock(f"{config.CONTACTS_FILE}.lock")
         try:
-            with open(temp_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            temp_file.replace(config.CONTACTS_FILE)
+            with lock.acquire(timeout=10):
+                with open(temp_file, "w") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                temp_file.replace(config.CONTACTS_FILE)
         except Exception as e:
             logger.error(f"Failed to save profiles: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
 
     def _get_processed_count(self) -> int:
         if config.CONTACTS_FILE.exists():
@@ -145,7 +232,7 @@ class ProfileExtractor:
             return 0
 
         total_updated = 0
-        batch_size_lines = 500 
+        batch_size_lines = 5000 
         current_batch_lines = []
         current_line_num = 0
         
@@ -180,6 +267,12 @@ class ProfileExtractor:
                 self._processed_line_count = current_line_num
                 self._save_profiles(current_line_num)
 
+        # Post-extraction: generate executive summaries for all profiles
+        if total_updated > 0:
+            logger.info("--- Generating Executive Summaries ---")
+            await self._generate_executive_summaries()
+            self._save_profiles(current_line_num)
+
         return total_updated
 
     async def _process_line_batch(self, lines: list[str]) -> int:
@@ -201,11 +294,14 @@ class ProfileExtractor:
             return 0
 
         all_tasks_metadata = []
+        group_chat_tasks = []
         chunk_size = getattr(config, "EXTRACTION_BATCH_SIZE", 50)
         
         for chat_id, messages in messages_by_chat.items():
             meaningful = [m for m in messages if len(m.get("text", "")) > 3]
             if not meaningful: continue
+            
+            chat_type = meaningful[0].get("chat_type", "single")
             
             other_participants = list(set(
                 m.get("sender_name") for m in meaningful 
@@ -214,93 +310,228 @@ class ProfileExtractor:
             other_name = other_participants[0] if other_participants else "Unknown"
             chat_name = meaningful[0].get("chat_name", other_name)
 
+            if chat_type == "group":
+                # Group chats: attribute facts to individual senders, don't create group profile
+                group_chat_tasks.append({
+                    "chat_id": chat_id,
+                    "chat_name": chat_name,
+                    "participants": other_participants,
+                    "messages": meaningful,
+                })
+                continue
+
             for i in range(0, len(meaningful), chunk_size):
                 chunk = meaningful[i:i + chunk_size]
                 all_tasks_metadata.append({
                     "sender_name": chat_name,
                     "sender_id": chat_id,
+                    "chat_type": chat_type,
                     "chunk": chunk
                 })
 
         total_tasks = len(all_tasks_metadata)
-        if total_tasks == 0:
-            return 0
-
-        logger.info(f"  Batch Tasks: {total_tasks} chunks")
-        
         contacts_updated_set = set()
         completed_count = 0
-        
-        async def process_task(metadata):
-            async with self._semaphore:
-                res = await self._extract_facts_async(
-                    metadata["sender_name"], 
-                    metadata["sender_id"], 
-                    metadata["chunk"]
-                )
-                return metadata, res
 
-        pending = [asyncio.ensure_future(process_task(m)) for m in all_tasks_metadata]
-        
-        for future in asyncio.as_completed(pending):
-            metadata, result = await future
-            completed_count += 1
+        if total_tasks > 0:
+            logger.info(f"  Single Chat Tasks: {total_tasks} chunks")
             
-            if result:
-                extraction_result: ExtractionResult = result
-                partner_id = metadata["sender_id"]
-                partner_name = metadata["sender_name"]
+            async def process_task(metadata):
+                async with self._semaphore:
+                    res = await self._extract_facts_async(
+                        metadata["sender_name"], 
+                        metadata["sender_id"], 
+                        metadata["chunk"]
+                    )
+                    return metadata, res
+
+            pending = [asyncio.ensure_future(process_task(m)) for m in all_tasks_metadata]
+            
+            for future in asyncio.as_completed(pending):
+                metadata, result = await future
+                completed_count += 1
                 
-                if extraction_result.summary_of_sender:
-                    partner_profile = self._get_or_create_profile(partner_id, partner_name)
-                    partner_profile.summary = extraction_result.summary_of_sender
-
-                for fact in extraction_result.extractions:
-                    subj_name = fact.subject_name
-                    if not subj_name: continue
+                if result:
+                    extraction_result: ExtractionResult = result
+                    partner_id = metadata["sender_id"]
+                    partner_name = metadata["sender_name"]
                     
-                    target_profile = None
-                    if subj_name.lower() in ["self", config.MY_NAME.lower()]:
-                        target_profile = self._get_or_create_profile(config.MY_NAME, config.MY_NAME)
-                        fact.is_first_party = True
-                    elif subj_name.lower() == partner_name.lower():
-                        target_profile = self._get_or_create_profile(partner_id, partner_name)
-                    else:
-                        target_profile = self.get_profile(subj_name)
-                        if not target_profile:
-                            target_profile = self._get_or_create_profile(subj_name, subj_name)
-                    
-                    if target_profile:
-                        target_profile.add_fact(fact)
-                        target_profile.message_count += 1
-                        contacts_updated_set.add(target_profile.contact_id)
+                    if extraction_result.summary_of_sender:
+                        partner_profile = self._get_or_create_profile(partner_id, partner_name)
+                        partner_profile.summary = extraction_result.summary_of_sender
+                        partner_profile.chat_type = metadata.get("chat_type", "single")
 
-                for rel in extraction_result.relationships:
-                    partner_profile = self._get_or_create_profile(partner_id, partner_name)
-                    partner_profile.add_relationship(rel)
-                    contacts_updated_set.add(partner_profile.contact_id)
+                    for fact in extraction_result.extractions:
+                        subj_name = fact.subject_name
+                        if not subj_name: continue
+                        
+                        target_profile = None
+                        if subj_name.lower() in ["self", config.MY_NAME.lower()]:
+                            target_profile = self._get_or_create_profile(config.MY_NAME, config.MY_NAME)
+                            fact.is_first_party = True
+                        elif subj_name.lower() == partner_name.lower():
+                            target_profile = self._get_or_create_profile(partner_id, partner_name)
+                        else:
+                            target_profile = self.get_profile(subj_name)
+                            if not target_profile:
+                                target_profile = self._get_or_create_profile(subj_name, subj_name)
+                        
+                        if target_profile:
+                            target_profile.add_fact(fact)
+                            target_profile.message_count += 1
+                            contacts_updated_set.add(target_profile.contact_id)
 
-            # Progress log for the current batch
-            if completed_count % 10 == 0 or completed_count == total_tasks:
-                progress = (completed_count / total_tasks) * 100
-                logger.debug(f"  Batch Progress: {progress:.1f}% ({completed_count}/{total_tasks})")
+                    for rel in extraction_result.relationships:
+                        partner_profile = self._get_or_create_profile(partner_id, partner_name)
+                        partner_profile.add_relationship(rel)
+                        contacts_updated_set.add(partner_profile.contact_id)
+
+                # Progress log for the current batch
+                if completed_count % 10 == 0 or completed_count == total_tasks:
+                    progress = (completed_count / total_tasks) * 100
+                    logger.debug(f"  Batch Progress: {progress:.1f}% ({completed_count}/{total_tasks})")
+
+        # Process group chats: attribute to individual senders, save group summary
+        if group_chat_tasks:
+            logger.info(f"  Group Chat Tasks: {len(group_chat_tasks)} chats")
+            for gc_meta in group_chat_tasks:
+                updated = await self._process_group_chat(gc_meta)
+                contacts_updated_set.update(updated)
 
         return len(contacts_updated_set)
 
-    def _get_or_create_profile(self, contact_id: str, display_name: str) -> ContactProfile:
-        if contact_id not in self._profiles:
-            self._profiles[contact_id] = ContactProfile(contact_id=contact_id, display_name=display_name)
-        return self._profiles[contact_id]
+    async def _process_group_chat(self, gc_meta: dict) -> set[str]:
+        """Process a group chat: attribute facts to individual senders, save group summary."""
+        chat_id = gc_meta["chat_id"]
+        chat_name = gc_meta["chat_name"]
+        participants = gc_meta["participants"]
+        messages = gc_meta["messages"]
+        
+        contacts_updated = set()
+        chunk_size = getattr(config, "EXTRACTION_BATCH_SIZE", 50)
+
+        # Extract facts from group chat messages, grouped by individual sender
+        messages_by_sender: dict[str, list[dict]] = {}
+        for msg in messages:
+            sender = msg.get("sender_name", "Unknown")
+            if msg.get("is_self", False):
+                sender = config.MY_NAME
+            if sender not in messages_by_sender:
+                messages_by_sender[sender] = []
+            messages_by_sender[sender].append(msg)
+
+        # Process each sender's messages as if they were a 1-on-1 conversation
+        for sender_name, sender_msgs in messages_by_sender.items():
+            if sender_name == config.MY_NAME:
+                continue  # Skip self messages for group extraction
+            
+            for i in range(0, len(sender_msgs), chunk_size):
+                chunk = sender_msgs[i:i + chunk_size]
+                async with self._semaphore:
+                    result = await self._extract_facts_async(
+                        sender_name, chat_id, chunk
+                    )
+                if result:
+                    for fact in result.extractions:
+                        subj_name = fact.subject_name
+                        if not subj_name: continue
+                        
+                        target_profile = None
+                        if subj_name.lower() in ["self", config.MY_NAME.lower()]:
+                            target_profile = self._get_or_create_profile(config.MY_NAME, config.MY_NAME)
+                            fact.is_first_party = True
+                        elif subj_name.lower() == sender_name.lower():
+                            target_profile = self._get_or_create_profile(sender_name, sender_name)
+                        else:
+                            target_profile = self.get_profile(subj_name)
+                            if not target_profile:
+                                target_profile = self._get_or_create_profile(subj_name, subj_name)
+                        
+                        if target_profile:
+                            target_profile.add_fact(fact)
+                            contacts_updated.add(target_profile.contact_id)
+
+                    for rel in result.relationships:
+                        sender_profile = self._get_or_create_profile(sender_name, sender_name)
+                        sender_profile.add_relationship(rel)
+                        contacts_updated.add(sender_profile.contact_id)
+
+        # Generate a group chat summary
+        try:
+            gc_summary = await self._summarize_group_chat(chat_id, chat_name, participants, messages)
+            self._group_chats[chat_id] = gc_summary
+        except Exception as e:
+            logger.warning(f"Failed to generate group chat summary for {chat_name}: {e}")
+
+        return contacts_updated
+
+    async def _summarize_group_chat(
+        self, chat_id: str, chat_name: str, participants: list[str], messages: list[dict]
+    ) -> GroupChatSummary:
+        """Generate a summary for a group chat conversation."""
+        formatted = []
+        for msg in messages[-50:]:  # Last 50 messages for summary
+            ts = msg.get("timestamp", "")[:16]
+            sender = config.MY_NAME if msg.get("is_self", False) else msg.get("sender_name", "Unknown")
+            text = msg.get("text", "")
+            formatted.append(f"[{ts}] {sender}: {text}")
+
+        prompt = GROUP_CHAT_SUMMARY_PROMPT.format(
+            chat_name=chat_name,
+            participants=", ".join(participants),
+            messages_block="\n".join(formatted),
+        )
+
+        async with self._semaphore:
+            try:
+                response = await self._gemini.generate_async(
+                    prompt,
+                    json_schema=GROUP_CHAT_SUMMARY_SCHEMA,
+                    temperature=0.2,
+                    max_output_tokens=512,
+                )
+                if response:
+                    data = json.loads(response)
+                    summary_text = data.get("summary", "")
+                else:
+                    summary_text = ""
+            except Exception as e:
+                logger.warning(f"Group chat summary generation failed: {e}")
+                summary_text = ""
+
+        return GroupChatSummary(
+            chat_id=chat_id,
+            display_name=chat_name,
+            participant_names=participants,
+            summary=summary_text,
+        )
+
+    def _get_or_create_profile(self, contact_id: str, display_name: str, chat_type: str = "single") -> ContactProfile:
+        # 1. Exact match by ID
+        if contact_id in self._profiles:
+            return self._profiles[contact_id]
+            
+        # 2. Try match by display name (Fuzzy/Exact) to merge identities across platforms
+        # We only do this for single chats to avoid merging group chats incorrectly
+        if chat_type == "single":
+            for profile in self._profiles.values():
+                if profile.display_name.lower() == display_name.lower():
+                    # Link this platform ID to the existing profile
+                    logger.info(f"  Merging platform ID '{contact_id}' into existing profile for '{display_name}'")
+                    self._profiles[contact_id] = profile
+                    return profile
+
+        # 3. Create new profile
+        new_profile = ContactProfile(contact_id=contact_id, display_name=display_name, chat_type=chat_type)
+        self._profiles[contact_id] = new_profile
+        return new_profile
 
     async def _extract_facts_async(self, sender_name: str, sender_id: str, messages: list[dict[str, Any]]) -> ExtractionResult | None:
         formatted_messages = []
         for msg in messages:
             ts = msg.get("timestamp", "")[:16]
             is_self = msg.get("is_self", False)
-            
-            # Use the EXACT names passed into the prompt context to avoid any naming ambiguity for the model
             sender_label = config.MY_NAME if is_self else sender_name
-            
             text = msg.get("text", "")
             formatted_messages.append(f"[{ts}] {sender_label}: {text}")
 
@@ -314,39 +545,84 @@ class ProfileExtractor:
 
         for attempt in range(2):
             try:
-                response = await self._call_ollama_async(prompt)
-                if not response: continue
-                json_start = response.find("{")
-                json_end = response.rfind("}") + 1
-                if json_start == -1 or json_end == 0: continue
-                data = json.loads(response[json_start:json_end])
+                response = await self._gemini.generate_async(
+                    prompt,
+                    json_schema=EXTRACTION_SCHEMA,
+                    temperature=0.1,
+                    max_output_tokens=2048,
+                )
+                if not response:
+                    continue
+                data = json.loads(response)
                 return ExtractionResult.model_validate(data)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Extraction attempt {attempt + 1} failed: {e}")
                 continue
         return None
 
-    async def _call_ollama_async(self, prompt: str) -> str:
+    async def _generate_executive_summaries(self):
+        """Post-extraction pass: generate comprehensive executive summaries for all profiles."""
+        profiles_to_summarize = [
+            p for p in self._profiles.values()
+            if p.chat_type == "single" and len(p.facts) > 0
+            and p.display_name != config.MY_NAME
+        ]
+
+        if not profiles_to_summarize:
+            return
+
+        logger.info(f"  Generating summaries for {len(profiles_to_summarize)} contacts...")
+
+        async def summarize_one(profile: ContactProfile):
+            async with self._semaphore:
+                return await self._generate_single_summary(profile)
+
+        tasks = [asyncio.ensure_future(summarize_one(p)) for p in profiles_to_summarize]
+        completed = 0
+
+        for future in asyncio.as_completed(tasks):
+            profile, summary = await future
+            completed += 1
+            if summary:
+                profile.summary = summary
+                logger.debug(f"  Summary generated for {profile.display_name}")
+            if completed % 10 == 0 or completed == len(tasks):
+                logger.info(f"  Summary Progress: {completed}/{len(tasks)}")
+
+    async def _generate_single_summary(self, profile: ContactProfile) -> tuple[ContactProfile, str]:
+        """Generate an executive summary for a single contact profile."""
+        # Format facts as a readable block
+        facts_lines = []
+        for f in profile.facts:
+            temporal = f" [{f.temporal_status}]" if f.temporal_status != "unknown" else ""
+            source = "self-reported" if f.is_first_party else "third-party"
+            facts_lines.append(f"- [{f.category}] {f.value} (confidence: {f.confidence}, source: {source}{temporal})")
+
+        # Format relationships
+        rel_lines = []
+        for r in profile.relationships:
+            rel_lines.append(f"- {r.type}: {r.target_name} — {r.context or 'no context'} (confidence: {r.confidence})")
+
+        prompt = EXECUTIVE_SUMMARY_PROMPT.format(
+            display_name=profile.display_name,
+            facts_block="\n".join(facts_lines) if facts_lines else "No facts extracted.",
+            relationships_block="\n".join(rel_lines) if rel_lines else "No relationships extracted.",
+        )
+
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.post(
-                    f"{self._ollama_url}/api/generate",
-                    json={
-                        "model": self._model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                        "options": {
-                            "temperature": 0.1,
-                            "num_predict": 1024, 
-                            "num_ctx": 4096      
-                        },
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json().get("response", "")
+            response = await self._gemini.generate_async(
+                prompt,
+                json_schema=EXECUTIVE_SUMMARY_SCHEMA,
+                temperature=0.3,
+                max_output_tokens=512,
+            )
+            if response:
+                data = json.loads(response)
+                return profile, data.get("summary", "")
         except Exception as e:
-            logger.error(f"Async Ollama call failed: {e}")
-            return ""
+            logger.warning(f"Summary generation failed for {profile.display_name}: {e}")
+
+        return profile, ""
 
     def get_all_profiles(self) -> dict[str, ContactProfile]:
         return self._profiles

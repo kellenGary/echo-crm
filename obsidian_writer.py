@@ -103,8 +103,6 @@ class ObsidianWriter:
         self._people_dir = self._base_dir / "People"
         self._places_dir = self._base_dir / "Places"
         self._topics_dir = self._base_dir / "Topics"
-        self._ollama_url = config.OLLAMA_BASE_URL
-        self._model = config.OLLAMA_MODEL
         self._extractor = ProfileExtractor()
 
         # Create directories

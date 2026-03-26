@@ -1,6 +1,6 @@
 "use client";
 import React from 'react';
-import { Database, Users, Activity, MessageSquare, Settings } from 'lucide-react';
+import { Database, Users, Activity, MessageSquare, Settings, Home } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import Link from 'next/link';
@@ -10,7 +10,7 @@ export function MiniSidebar() {
   const pathname = usePathname();
   
   const modules = [
-    { id: 'dashboard', icon: Database, href: '/' },
+    { id: 'dashboard', icon: Home, href: '/' },
     { id: 'contactsExplorer', icon: Users, href: '/contactsExplorer' },
     { id: 'discoveries', icon: Activity, href: '/discoveries' },
     { id: 'intelligence', icon: MessageSquare, href: '/intelligence' },
@@ -29,7 +29,9 @@ export function MiniSidebar() {
               size="icon" 
               className={cn(
                 "size-8", 
-                pathname.startsWith(m.href) ? "text-primary bg-primary/10" : "text-muted-foreground hover:text-foreground"
+                (m.href === '/' ? pathname === '/' : pathname.startsWith(m.href)) 
+                  ? "text-primary bg-primary/10" 
+                  : "text-muted-foreground hover:text-foreground"
               )}
             >
               <m.icon className="size-4" />

@@ -1,72 +1,40 @@
 """
-Vector Store — Handles semantic search using Ollama embeddings and ChromaDB.
+Vector Store — Handles semantic search using Gemini embeddings and ChromaDB.
 """
 
 import logging
-import json
-from typing import Any, List, Optional
-import httpx
+from typing import List
+
 import chromadb
 from chromadb.config import Settings
+from chromadb import EmbeddingFunction, Documents, Embeddings
+
 import config
+from gemini_client import GeminiClient
 
 logger = logging.getLogger(__name__)
 
-from chromadb import EmbeddingFunction, Documents, Embeddings
 
-class OllamaEmbeddingFunction(EmbeddingFunction):
-    """Custom embedding function that calls Ollama's API."""
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    """Custom ChromaDB embedding function that calls Gemini's embedding API."""
     
-    def __init__(self, model_name: str, base_url: str):
-        self.model_name = model_name
-        self.base_url = base_url
+    def __init__(self):
+        self._gemini = GeminiClient()
 
     def __call__(self, input: List[str]) -> List[List[float]]:
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def get_one(text: str) -> List[float]:
-            try:
-                # Use the newer /api/embed endpoint which is more robust
-                with httpx.Client(timeout=60.0) as client:
-                    resp = client.post(
-                        f"{self.base_url}/api/embed",
-                        json={"model": self.model_name, "input": text},
-                    )
-                    if resp.status_code != 200:
-                        logger.error(f"Ollama embedding error ({resp.status_code}): {resp.text}")
-                        resp.raise_for_status()
-                    
-                    data = resp.json()
-                    # /api/embed returns {"embeddings": [[...]]}
-                    if "embeddings" in data:
-                        return data["embeddings"][0]
-                    # Fallback to older /api/embeddings format if needed
-                    elif "embedding" in data:
-                        return data["embedding"]
-                    else:
-                        logger.error(f"Unexpected response format from Ollama: {data}")
-                        return [0.0] * 768
-            except Exception as e:
-                logger.error(f"Failed to get embedding from Ollama model '{self.model_name}': {e}")
-                return [0.0] * 768
-
-        # Parallelize embedding calls
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            embeddings = list(executor.map(get_one, input))
-            
-        # Ensure it's a list of lists (Embeddings type)
-        return embeddings
+        return self._gemini.embed(input)
 
     def embed_query(self, input: str) -> List[float]:
-        """Embed a single query string (supporting 'input' keyword)."""
+        """Embed a single query string."""
         return self.__call__([input])[0]
 
     def embed_documents(self, input: List[str]) -> List[List[float]]:
-        """Embed a list of document strings (supporting 'input' keyword)."""
+        """Embed a list of document strings."""
         return self.__call__(input)
 
     def name(self) -> str:
-        return "ollama"
+        return "gemini"
+
 
 class VectorStore:
     """
@@ -79,10 +47,7 @@ class VectorStore:
             settings=Settings(allow_reset=True)
         )
         
-        self._embed_fn = OllamaEmbeddingFunction(
-            model_name=config.OLLAMA_EMBED_MODEL,
-            base_url=config.OLLAMA_BASE_URL
-        )
+        self._embed_fn = GeminiEmbeddingFunction()
         
         # Simple collection for all messages
         self._collection = self._client.get_or_create_collection(
@@ -139,8 +104,7 @@ class VectorStore:
         Perform semantic search for phrases or questions.
         Returns a list of message objects.
         """
-        # Explicitly embed the query to avoid potential type issues in the Rust bridge
-        # through the default query_texts path in some chromadb versions.
+        # Explicitly embed the query
         query_embeddings = self._embed_fn([query])
         
         results = self._collection.query(

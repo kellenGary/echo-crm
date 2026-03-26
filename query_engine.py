@@ -4,7 +4,7 @@ Query Engine — interactive CLI for asking questions about your contacts.
 Responsibilities:
   - Accept natural language questions about contacts
   - Look up relevant context from contact profiles AND raw message logs
-  - Send context + question to Ollama for a grounded answer
+  - Send context + question to Gemini for a grounded answer
 
 Two-tier retrieval:
   1. Fast path: Check extracted contact profiles first
@@ -15,9 +15,8 @@ import json
 import logging
 from typing import Any
 
-import httpx
-
 import config
+from gemini_client import GeminiClient
 from profile_extractor import ProfileExtractor
 from vector_store import VectorStore
 
@@ -48,8 +47,7 @@ class QueryEngine:
     """
 
     def __init__(self):
-        self._ollama_url = config.OLLAMA_BASE_URL
-        self._model = config.OLLAMA_MODEL
+        self._gemini = GeminiClient()
         self._extractor = ProfileExtractor()
         self._vector_store = VectorStore()
 
@@ -74,7 +72,12 @@ class QueryEngine:
             question=question,
         )
 
-        return self._call_ollama(prompt)
+        response = self._gemini.generate(
+            prompt,
+            temperature=0.3,
+            max_output_tokens=512,
+        )
+        return response or "No response from LLM"
 
     def _get_relevant_profiles(self, question: str) -> str:
         """Find contact profiles relevant to the question."""
@@ -135,32 +138,6 @@ class QueryEngine:
             formatted.append(msg["text"])
 
         return "\n".join(formatted)
-
-    def _call_ollama(self, prompt: str) -> str:
-        """Call Ollama's generate endpoint."""
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.post(
-                    f"{self._ollama_url}/api/generate",
-                    json={
-                        "model": self._model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": 0.3,
-                            "num_predict": 512,
-                        },
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json().get("response", "No response from LLM")
-        except httpx.ConnectError:
-            return (
-                "❌ Cannot connect to Ollama. Make sure it's running: "
-                "`ollama serve`"
-            )
-        except Exception as e:
-            return f"❌ LLM query failed: {e}"
 
     def list_contacts(self) -> list[dict[str, Any]]:
         """List all known contacts with their fact count."""

@@ -41,7 +41,7 @@ logger = logging.getLogger("echo-crm")
 
 # ── Commands ─────────────────────────────────────────────────────────
 
-def cmd_sync() -> int:
+def cmd_sync(limit_chats: int = None, limit_messages: int = None) -> int:
     """Sync messages from Beeper Desktop API to local JSONL log."""
     logger.info("Starting message sync from Beeper...")
     with BeeperClient() as client:
@@ -56,18 +56,29 @@ def cmd_sync() -> int:
             return 1
 
         ml = MessageLogger(client)
-        new_count = ml.sync_all()
+        new_count = ml.sync_all(limit_chats=limit_chats, limit_messages=limit_messages)
         logger.info(f"✓ Sync complete — {new_count} new messages logged")
         logger.info(f"  Log file: {config.RAW_LOG_FILE}")
     return 0
 
 
+def cmd_reset() -> int:
+    """Wipe all data and reset the system."""
+    import subprocess
+    from pathlib import Path
+    script_path = Path(__file__).parent / "reset_system.py"
+    try:
+        return subprocess.call([sys.executable, str(script_path)])
+    except KeyboardInterrupt:
+        return 0
+
+
 async def cmd_extract(force_all: bool = False) -> int:
     """Run LLM profile extraction on messages."""
-    logger.info("Starting grounded async profile extraction with Ollama...")
+    logger.info("Starting grounded async profile extraction with Gemini...")
     if force_all:
         logger.info("  !! DEEP ENRICHMENT MODE !! (Processing all history)")
-    logger.info(f"  Model: {config.OLLAMA_MODEL}")
+    logger.info(f"  Model: {config.GEMINI_MODEL}")
 
     extractor = ProfileExtractor()
     updated = await extractor.extract_profiles(force_all=force_all)
@@ -276,7 +287,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["sync", "index", "extract", "ask", "contacts", "run", "daemon", "bot", "obsidian"],
+        choices=["sync", "index", "extract", "ask", "contacts", "run", "daemon", "bot", "obsidian", "reset"],
         help="Command to run",
     )
     parser.add_argument(
@@ -286,6 +297,14 @@ def main():
     parser.add_argument(
         "--force", action="store_true",
         help="Force re-extraction of ALL messages (Deep Enrichment)",
+    )
+    parser.add_argument(
+        "--limit-chats", type=int,
+        help="Limit sync to this many chats (useful for testing)",
+    )
+    parser.add_argument(
+        "--limit-messages", type=int,
+        help="Limit number of messages per chat during sync",
     )
 
     args = parser.parse_args()
@@ -307,8 +326,12 @@ def main():
 
     if args.command == "extract":
         sys.exit(asyncio.run(cmd_extract(force_all=args.force)))
+    elif args.command == "sync":
+        sys.exit(cmd_sync(limit_chats=args.limit_chats, limit_messages=args.limit_messages))
     elif args.command in ["run", "daemon"]:
         sys.exit(asyncio.run(commands[args.command]()))
+    elif args.command == "reset":
+        sys.exit(cmd_reset())
     else:
         result = commands[args.command]()
         if isinstance(result, int):

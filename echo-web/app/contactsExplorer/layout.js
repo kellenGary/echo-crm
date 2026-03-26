@@ -47,7 +47,7 @@ export default function ContactsLayout({ children }) {
           setSidebarCollapsed={setSidebarCollapsed}
         />
         
-        <div className="flex-1 overflow-hidden relative min-w-0">
+        <div className="flex-1 relative min-w-0 flex flex-col h-full">
           {children}
         </div>
       </div>

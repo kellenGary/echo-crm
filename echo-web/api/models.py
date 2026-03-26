@@ -38,6 +38,7 @@ class ContactProfile(BaseModel):
     facts: list[Fact] = []
     relationships: list[Relationship] = []
     summary: str = ""
+    chat_type: str = "single"
     last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message_count: int = 0
 

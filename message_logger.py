@@ -101,7 +101,7 @@ class MessageLogger:
         logger.info(f"Loaded {len(seen)} existing message IDs from log")
         return seen
 
-    def sync_all(self) -> int:
+    def sync_all(self, limit_chats: int = None, limit_messages: int = None) -> int:
         """
         Sync messages from all chats. Returns total new messages logged.
 
@@ -113,6 +113,10 @@ class MessageLogger:
         # Fetch all chats with pagination
         all_chats = self._fetch_all_chats()
         logger.info(f"Found {len(all_chats)} chats to sync")
+        
+        if limit_chats:
+            all_chats = all_chats[:limit_chats]
+            logger.info(f"  Limiting sync to first {len(all_chats)} chats for testing")
 
         for chat in all_chats:
             chat_id = chat.get("id", "")
@@ -124,7 +128,7 @@ class MessageLogger:
                 continue
 
             try:
-                new_count = self._sync_chat(chat_id, chat_name, chat_type)
+                new_count = self._sync_chat(chat_id, chat_name, chat_type, limit_messages=limit_messages)
                 total_new += new_count
                 if new_count > 0:
                     logger.info(f"  [{chat_name}] +{new_count} messages")
@@ -164,10 +168,13 @@ class MessageLogger:
 
         return all_chats
 
-    def _sync_chat(self, chat_id: str, chat_name: str, chat_type: str) -> int:
+    def _sync_chat(self, chat_id: str, chat_name: str, chat_type: str, limit_messages: int = None) -> int:
         """Sync messages for a single chat. Returns count of new messages."""
         new_messages: list[dict[str, Any]] = []
         messages_fetched = 0
+
+        # Use passed limit or default
+        max_limit = limit_messages if limit_messages is not None else config.MAX_MESSAGES_PER_CHAT
 
         # If we have a previous cursor, fetch only newer messages
         saved_cursor = self._sync_state.get_newest_cursor(chat_id)
@@ -177,7 +184,7 @@ class MessageLogger:
         newest_cursor = None
         oldest_cursor = None
 
-        while messages_fetched < config.MAX_MESSAGES_PER_CHAT:
+        while messages_fetched < max_limit:
             try:
                 resp = self._client.list_messages(
                     chat_id=chat_id, cursor=cursor, direction=direction

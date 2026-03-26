@@ -20,7 +20,7 @@ export function ControlCenter({ taskStatus, runTask, getStatusBadge }) {
         />
         <CommandCard 
           title="LLM Extraction" 
-          desc="Run Ollama profile enrichment" 
+          desc="Run Gemini profile enrichment" 
           icon={Brain} 
           onRun={() => runTask('extract')}
           status={taskStatus.extract}

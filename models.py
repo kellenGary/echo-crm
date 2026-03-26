@@ -9,6 +9,7 @@ class Fact(BaseModel):
     confidence: str = Field("medium", description="high|medium|low")
     source_quote: Optional[str] = Field(None, description="Exact snippet from the text")
     is_first_party: bool = Field(True, description="True if the subject is speaking about themselves")
+    temporal_status: str = Field("unknown", description="current|past|unknown — whether this fact is still true")
     extracted_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @field_validator("confidence")
@@ -18,6 +19,13 @@ class Fact(BaseModel):
             return "medium"
         return v.lower()
 
+    @field_validator("temporal_status")
+    @classmethod
+    def validate_temporal_status(cls, v: str) -> str:
+        if v.lower() not in ["current", "past", "unknown"]:
+            return "unknown"
+        return v.lower()
+
 class Relationship(BaseModel):
     target_name: str
     target_id: Optional[str] = None
@@ -25,6 +33,12 @@ class Relationship(BaseModel):
     context: Optional[str] = None
     confidence: str = "medium"
     extracted_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @field_validator("type")
+    @classmethod
+    def normalize_type(cls, v: str) -> str:
+        """Normalize compound types like 'friend|colleague' → first value, lowercased."""
+        return v.split("|")[0].strip().lower()
 
 class ExtractionResult(BaseModel):
     reasoning_scratchpad: Optional[str] = None
@@ -38,6 +52,7 @@ class ContactProfile(BaseModel):
     facts: list[Fact] = []
     relationships: list[Relationship] = []
     summary: str = ""
+    chat_type: str = "single"
     last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message_count: int = 0
 
@@ -72,12 +87,36 @@ class ContactProfile(BaseModel):
         self.last_updated = datetime.now(timezone.utc).isoformat()
 
     def add_relationship(self, rel: Relationship):
-        """Add or update a relationship."""
+        """Add or update a relationship. Rejects low confidence and deduplicates."""
+        # Skip low-confidence relationships
+        if rel.confidence.lower() == "low":
+            return
+
+        rel_target = rel.target_name.lower().strip()
+        rel_type = rel.type.lower().strip()
+
         for existing in self.relationships:
-            if existing.target_name.lower() == rel.target_name.lower() and existing.type == rel.type:
-                return # Skip duplicate simple relationships for now
+            existing_target = existing.target_name.lower().strip()
+            existing_type = existing.type.lower().strip()
+
+            # Same target — check for type overlap
+            if existing_target == rel_target:
+                # Exact type match → skip
+                if existing_type == rel_type:
+                    return
+                # If one is 'knows' and the other is more specific, keep the specific one
+                if rel_type == "knows":
+                    return  # already have a more specific type
+
         self.relationships.append(rel)
         self.last_updated = datetime.now(timezone.utc).isoformat()
+
+class GroupChatSummary(BaseModel):
+    chat_id: str
+    display_name: str
+    participant_names: list[str] = []
+    summary: str = ""
+    last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class IntelligenceGraph(BaseModel):
     nodes: list[dict[str, Any]] = [] # {id, label, type, val}

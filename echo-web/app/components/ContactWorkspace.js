@@ -174,14 +174,14 @@ export function ContactWorkspace({
   }
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden bg-black/10">
+    <div className="flex flex-1 flex-col h-full min-h-0 bg-black/10">
       <ContactHeader
         sidebarCollapsed={sidebarCollapsed}
         setSidebarCollapsed={setSidebarCollapsed}
         displayName={selectedContact.display_name}
       />
 
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-y-auto min-h-0 p-6">
         <div className="max-w-5xl mx-auto space-y-6">
           <ContactIdentity contact={selectedContact} />
 

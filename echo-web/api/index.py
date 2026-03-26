@@ -16,8 +16,20 @@ from pydantic import BaseModel
 import main
 import asyncio
 import logging
+import time
+from filelock import FileLock
 
 logger = logging.getLogger("echo-api")
+
+# Write lock for contacts.json (inter-process)
+_storage_lock = FileLock(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data/contacts.json.lock")))
+
+# --- Filter out frequent task status polling from console logs ---
+class TaskStatusFilter(logging.Filter):
+    def filter(self, record):
+        return "/api/tasks/status" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(TaskStatusFilter())
 
 app = FastAPI()
 
@@ -216,10 +228,19 @@ def sync_relationships(contact_id: str, updated_profile: ContactProfile):
                         target_data["relationships"] = []
                     target_data["relationships"].append(new_rel.model_dump())
 
-        # Save back
+        # Save back atomically
         db["contacts"] = contacts
-        with open(data_path, "w") as f:
-            json.dump(db, f, indent=2, ensure_ascii=False)
+        
+        temp_path = f"{data_path}.tmp.{os.getpid()}"
+        try:
+            with _storage_lock.acquire(timeout=10):
+                with open(temp_path, "w") as f:
+                    json.dump(db, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, data_path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
             
     except Exception as e:
         print(f"Error in sync_relationships task: {e}")
@@ -256,8 +277,16 @@ async def delete_fact(contact_id: str, fact_index: int):
             profile_data["facts"].pop(fact_index)
             profile_data["last_updated"] = datetime.now(timezone.utc).isoformat()
             
-            with open(data_path, "w") as f:
-                json.dump(db, f, indent=2, ensure_ascii=False)
+            temp_path = f"{data_path}.tmp.{os.getpid()}"
+            try:
+                with _storage_lock.acquire(timeout=10):
+                    with open(temp_path, "w") as f:
+                        json.dump(db, f, indent=2, ensure_ascii=False)
+                    os.replace(temp_path, data_path)
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise e
             return {"status": "success"}
         else:
             raise HTTPException(status_code=400, detail="Invalid fact index")

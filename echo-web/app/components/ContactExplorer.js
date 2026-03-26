@@ -15,9 +15,18 @@ export function ContactExplorer({
   sidebarCollapsed,
   setSidebarCollapsed,
 }) {
-  const imsgContacts = filteredContacts.filter((c) =>
-    c.contact_id?.startsWith("imsg"),
-  );
+  const imsgContacts = filteredContacts.filter((c) => {
+    const isImsg = c.contact_id?.startsWith("imsg");
+    const isGroup = c.contact_id?.includes("thread") || c.contact_id?.includes("group") || c.chat_type === "group";
+    
+    // An unsaved contact typically has a name that's just a number or email, or is "Unknown"
+    // We check if it has any alphabetical characters to distinguish names from numbers
+    const hasLetters = /[a-zA-Z]/.test(c.display_name || "");
+    const isUnsaved = !hasLetters || c.display_name?.includes("@") || c.display_name === "Unknown";
+    
+    // We want individual iMessage contacts that have been resolved to real names (on my Mac)
+    return isImsg && !isGroup && !isUnsaved;
+  });
 
   return (
     <div

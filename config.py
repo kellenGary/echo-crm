@@ -4,25 +4,37 @@ Central configuration for the Beeper message logging and contact intelligence se
 
 import os
 from pathlib import Path
-import os
+from dotenv import load_dotenv
 
-MY_NAME = "Kellen"
+load_dotenv()  # Load .env file before reading env vars
+
+MY_NAME = "Kellen Gary"
 
 # --- Beeper Desktop API ---
 BEEPER_BASE_URL = os.getenv("BEEPER_BASE_URL", "http://localhost:23373")
-BEEPER_API_TOKEN = os.getenv("BEEPER_API_TOKEN", "7160b021-e5a0-4c29-8c3f-816f31f99151")
+BEEPER_API_TOKEN = os.getenv("BEEPER_API_TOKEN")
 
-# --- Ollama LLM ---
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+# --- Google Gemini API ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
+
+# --- Gemini Rate Limits (Gemini 3 Flash Testing) ---
+GEMINI_RPM = float(os.getenv("GEMINI_RPM", "4000.0"))
+GEMINI_RPD = int(os.getenv("GEMINI_RPD", "4000000"))
+GEMINI_CONTEXT_WINDOW = 250000
 
 # --- Extraction Performance ---
-EXTRACTION_BATCH_SIZE = int(os.getenv("EXTRACTION_BATCH_SIZE", "50"))
-EXTRACTION_CONCURRENCY = int(os.getenv("EXTRACTION_CONCURRENCY", "4"))
+EXTRACTION_BATCH_SIZE = int(os.getenv("EXTRACTION_BATCH_SIZE", "100"))
+EXTRACTION_CONCURRENCY = int(os.getenv("EXTRACTION_CONCURRENCY", "100"))
+
+# --- Database ---
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- Data Storage ---
 DATA_DIR = Path(os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")))
+GEMINI_MAX_SPEND = float(os.getenv("GEMINI_MAX_SPEND", "25.0"))
+GEMINI_USAGE_FILE = DATA_DIR / "gemini_usage.json"
 RAW_LOG_FILE = DATA_DIR / "messages.jsonl"          # Raw message log (JSON Lines)
 CONTACTS_FILE = DATA_DIR / "contacts.json"           # Extracted contact profiles
 SYNC_STATE_FILE = DATA_DIR / "sync_state.json"       # Tracks last sync position per chat
