@@ -165,7 +165,7 @@ class ExtractedFact(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=func.uuid_generate_v4()
     )
     summary: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding = mapped_column(Vector(768))  # pgvector column — dimension matches your embed model
+    # embedding = mapped_column(Vector(768))  # pgvector column — commented out if not available
     source_message_ids: Mapped[list] = mapped_column(
         ARRAY(UUID(as_uuid=True)), nullable=False, server_default="{}"
     )

@@ -28,12 +28,14 @@ export default function ContactsLayout({ children }) {
     };
     fetchContacts();
   }, []);
+  const deferredSearch = React.useDeferredValue(search);
 
   const filteredContacts = useMemo(() => {
+    const searchLower = deferredSearch.toLowerCase();
     return contacts.filter((c) => 
-      c.display_name.toLowerCase().includes(search.toLowerCase())
+      c.display_name.toLowerCase().includes(searchLower)
     );
-  }, [contacts, search]);
+  }, [contacts, deferredSearch]);
 
   return (
     <ContactsContext.Provider value={{ contacts, filteredContacts, selectedContactId }}>

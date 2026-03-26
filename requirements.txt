@@ -10,3 +10,8 @@ pathlib
 argparse
 asyncio
 jsonpickle
+sqlalchemy
+pgvector
+tinydb
+filelock
+pydantic

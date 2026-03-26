@@ -10,7 +10,7 @@
 
 -- Required extensions --------------------------------------------------------
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";   -- uuid_generate_v4()
-CREATE EXTENSION IF NOT EXISTS "vector";      -- pgvector for embeddings
+-- CREATE EXTENSION IF NOT EXISTS "vector";      -- pgvector for embeddings (commented out if not available)
 
 -- 1. contacts ----------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS contacts (
@@ -87,17 +87,16 @@ CREATE INDEX IF NOT EXISTS idx_messages_is_extracted
 CREATE TABLE IF NOT EXISTS extracted_facts (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     summary             TEXT NOT NULL,
-    embedding           vector(768),       -- dimension must match your model
+    -- embedding           vector(768),       -- (pgvector version)
     source_message_ids  UUID[] NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Approximate nearest-neighbor index (IVFFlat).
--- Tune `lists` when the table grows (rule of thumb: sqrt(row_count)).
-CREATE INDEX IF NOT EXISTS idx_extracted_facts_embedding
-    ON extracted_facts
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- CREATE INDEX IF NOT EXISTS idx_extracted_facts_embedding
+--     ON extracted_facts
+--     USING ivfflat (embedding vector_cosine_ops)
+--     WITH (lists = 100);
 
 -- 6. contact_facts (many-to-many join) ---------------------------------------
 CREATE TABLE IF NOT EXISTS contact_facts (

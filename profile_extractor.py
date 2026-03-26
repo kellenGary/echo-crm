@@ -2,14 +2,13 @@ import asyncio
 import json
 import logging
 import os
-from filelock import FileLock
 from datetime import datetime, timezone
 from typing import Any
 from pydantic import ValidationError
 import config
 from gemini_client import GeminiClient
 from models import ContactProfile, ExtractionResult, Fact, GroupChatSummary
-from storage import DataStore
+from db.repository import ContactRepository
 
 logger = logging.getLogger(__name__)
 
@@ -161,70 +160,55 @@ GROUP_CHAT_SUMMARY_SCHEMA = {
 class ProfileExtractor:
     def __init__(self):
         self._gemini = GeminiClient()
-        self._store = DataStore(config.DATA_DIR / "echo_nosql.json")
-        self._profiles: dict[str, ContactProfile] = self._store.get_all_profiles()
+        self._repo = ContactRepository()
+        self._profiles: dict[str, ContactProfile] = self._load_profiles_from_db()
         self._group_chats: dict[str, GroupChatSummary] = {}
         self._processed_line_count = self._get_processed_count()
         concurrency = getattr(config, "EXTRACTION_CONCURRENCY", 2)
-        self._semaphore = asyncio.Semaphore(concurrency) 
+        self._semaphore = asyncio.Semaphore(concurrency)
 
-    def _load_profiles(self) -> dict[str, ContactProfile]:
+    def _load_profiles_from_db(self) -> dict[str, ContactProfile]:
+        """Load all existing profiles from the database."""
         profiles: dict[str, ContactProfile] = {}
-        if config.CONTACTS_FILE.exists():
-            try:
-                with open(config.CONTACTS_FILE) as f:
-                    data = json.load(f)
-                    for contact_id, profile_data in data.get("contacts", {}).items():
-                        try:
-                            profiles[contact_id] = ContactProfile.model_validate(profile_data)
-                        except ValidationError as e:
-                            logger.warning(f"Failed to validate profile for {contact_id}: {e}")
-            except Exception as e:
-                logger.error(f"Failed to load contacts file: {e}")
-        logger.info(f"Loaded {len(profiles)} existing contact profiles")
+        try:
+            all_contacts = self._repo.get_all_contacts()
+            for contact_data in all_contacts:
+                display_name = contact_data.get("display_name", "")
+                if display_name.startswith("__"):
+                    continue  # Skip metadata rows
+                contact_id = contact_data.get("contact_id", "")
+                try:
+                    profiles[contact_id] = ContactProfile.model_validate(contact_data)
+                except ValidationError as e:
+                    logger.warning(f"Failed to validate profile for {contact_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load profiles from database: {e}")
+        logger.info(f"Loaded {len(profiles)} existing contact profiles from database")
         return profiles
 
     def _save_profiles(self, processed_lines: int):
-        # Save to NoSQL Store
-        for profile in self._profiles.values():
-            self._store.save_profile(profile)
+        """Persist all profiles to the database."""
+        for cid, profile in self._profiles.items():
+            try:
+                profile_data = profile.model_dump()
+                self._repo.upsert_contact(
+                    legacy_contact_id=cid,
+                    display_name=profile.display_name,
+                    profile_data=profile_data,
+                )
+            except Exception as e:
+                logger.error(f"Failed to save profile for {cid}: {e}")
 
-        # Run Fact Resolver Analytic
-        discoveries = self._store.get_shared_intelligence()
-
-        data = {
-            "contacts": {
-                cid: profile.model_dump() for cid, profile in self._profiles.items()
-            },
-            "group_chats": {
-                cid: gc.model_dump() for cid, gc in self._group_chats.items()
-            },
-            "discoveries": discoveries, 
-            "last_extraction": datetime.now(timezone.utc).isoformat(),
-            "total_contacts": len(self._profiles),
-            "processed_lines": processed_lines
-        }
-        temp_file = config.CONTACTS_FILE.with_suffix(f".tmp.{os.getpid()}")
-        lock = FileLock(f"{config.CONTACTS_FILE}.lock")
-        try:
-            with lock.acquire(timeout=10):
-                with open(temp_file, "w") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                temp_file.replace(config.CONTACTS_FILE)
-        except Exception as e:
-            logger.error(f"Failed to save profiles: {e}")
-            if temp_file.exists():
-                temp_file.unlink()
+        # Save extraction checkpoint
+        self._repo.save_extraction_state(processed_lines)
+        logger.debug(f"Saved {len(self._profiles)} profiles to database (checkpoint: line {processed_lines})")
 
     def _get_processed_count(self) -> int:
-        if config.CONTACTS_FILE.exists():
-            with open(config.CONTACTS_FILE) as f:
-                try:
-                    data = json.load(f)
-                    return data.get("processed_lines", 0)
-                except Exception:
-                    return 0
-        return 0
+        """Read extraction checkpoint from the database."""
+        try:
+            return self._repo.get_extraction_state()
+        except Exception:
+            return 0
 
     async def extract_profiles(self, force_all: bool = False) -> int:
         if not config.RAW_LOG_FILE.exists():
